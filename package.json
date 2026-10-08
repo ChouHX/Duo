@@ -1,0 +1,40 @@
+{
+  "name": "duo-killer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "build": "tsc --noEmit && vite build",
+    "desktop": "tauri dev",
+    "bundle": "node scripts/build_app.mjs",
+    "tauri": "tauri",
+    "worker:setup": "node scripts/python.mjs scripts/setup_worker.py",
+    "worker:build": "node scripts/python.mjs scripts/build_worker.py",
+    "test:worker": "node scripts/python.mjs scripts/test_worker.py",
+    "check:format": "prettier --check src tests/ui scripts/python.mjs playwright.config.ts",
+    "test": "pnpm build && pnpm test:ui",
+    "test:ui": "playwright test",
+    "build:web": "node scripts/python.mjs scripts/build_web.py",
+    "test:web": "node scripts/python.mjs tests/local_web/smoke.py",
+    "test:web:ui": "playwright test --config playwright.web.config.ts",
+    "dev:web": "node scripts/dev-web.mjs",
+    "test:dev:web": "playwright test --config playwright.web.config.ts dev.spec.ts"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.1",
+    "lucide-react": "^0.468.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.0",
+    "@tauri-apps/cli": "2.12.1",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "prettier": "3.6.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.3"
+  }
+}

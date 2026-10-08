@@ -1,0 +1,52 @@
+name: Desktop packages
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            label: mac-arm64
+          - os: macos-15-intel
+            label: mac-x64
+          - os: windows-latest
+            label: win-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11.9.0'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: pnpm install --frozen-lockfile
+      - run: python scripts/setup_worker.py
+      - run: python scripts/test_worker.py
+      - run: python scripts/build_worker.py
+      - run: python scripts/smoke_worker.py
+      - run: pnpm build
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - run: pnpm exec playwright install chromium
+      - run: pnpm test:ui
+      - run: pnpm bundle
+      - if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent "src-tauri/target/release/bundle/macos/DUO Killer.app" "src-tauri/target/release/bundle/DUO Killer-app.zip"
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "src-tauri/target/release/bundle/portable/DUO Killer" -DestinationPath "src-tauri/target/release/bundle/DUO Killer-app.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duo-killer-${{ matrix.label }}
+          path: src-tauri/target/release/bundle/DUO Killer-app.zip

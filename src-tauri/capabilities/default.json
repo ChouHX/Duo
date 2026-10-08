@@ -1,0 +1,1 @@
+{"identifier":"main","description":"Local desktop UI events only. Account and worker access is validated by Rust commands.","windows":["main"],"permissions":["core:default"]}
