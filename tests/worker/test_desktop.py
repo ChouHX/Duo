@@ -109,6 +109,37 @@ class ServiceTests(unittest.TestCase):
 
 
 class ProcessIsolationTests(unittest.TestCase):
+    def test_worker_protocol_uses_utf8_with_non_utf8_system_encoding(self):
+        root = Path(__file__).resolve().parents[2] / 'worker'
+        account_id, task_id = str(uuid.UUID(int=0)), str(uuid.uuid4())
+        address = {
+            'contact': {'lastName': '测', 'firstName': '试', 'emailAddress': 'fixture@example.test', 'fullDaytimePhone': '13800000000'},
+            'delivery': {'state': '四川', 'city': '成都', 'district': '锦江区'},
+            'address': {'street': '测试路 1 号'},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            process = subprocess.Popen(
+                [sys.executable, str(root / 'main.py'), '--data-dir', directory, '--account-id', account_id, '--task-id', task_id],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding='utf-8',
+                env={**os.environ, 'PYTHONIOENCODING': 'cp1252', 'PYTHONUTF8': '0'},
+            )
+            try:
+                request = dict(account_id=account_id, task_id=task_id, account='', action='address_save', params=address)
+                process.stdin.write(json.dumps(request, ensure_ascii=False) + '\n')
+                process.stdin.flush()
+                event = json.loads(process.stdout.readline())
+                self.assertEqual(event['type'], 'result', event)
+                self.assertEqual(event['result']['config'], address)
+                self.assertEqual(event['result']['message'], '快捷地址已保存，结账时可选择使用。')
+                self.assertEqual(process.wait(15), 0)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(5)
+                for pipe in (process.stdin, process.stdout, process.stderr):
+                    pipe.close()
+
     def test_two_concurrent_workers_write_only_their_account(self):
         root=Path(__file__).resolve().parents[2]/'worker'
         with tempfile.TemporaryDirectory() as directory:

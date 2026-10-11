@@ -97,4 +97,8 @@ def main():
 
 
 if __name__ == '__main__':
+    # Frozen Windows workers may ignore PYTHONIOENCODING; IPC always uses UTF-8.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='strict')
     main()
