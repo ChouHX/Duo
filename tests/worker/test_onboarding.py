@@ -65,6 +65,29 @@ class AccountCheckTests(unittest.TestCase):
         self.login.assert_not_called()
         self.service.vault.save.assert_not_called()
 
+    def test_password_saved_on_input_so_site_outage_does_not_lose_it(self):
+        """官网维护/5xx 时登录会失败，输入时勾选保存的密码仍要写入保险库。"""
+        from apple_login import LoginError
+        self.service.vault.get.return_value = None
+        self.service.channel.prompt = Mock(return_value={'password': 'secret', 'remember': True})
+        error = LoginError('Apple 官网暂时不可用', status=503)
+
+        def failing_login(*_args, **_kwargs):
+            self.service.credentials(Path('auth.json'))  # 登录流程先取密码
+            raise error
+
+        self.login.side_effect = failing_login
+        self.info.side_effect = [ValueError('未确认当前登录人')]
+        with self.assertRaises(LoginError):
+            self.service.run('me', {})
+        self.service.vault.save.assert_called_once_with('a', 'secret')
+
+    def test_password_not_saved_without_remember(self):
+        self.service.vault.get.return_value = None
+        self.service.channel.prompt = Mock(return_value={'password': 'secret', 'remember': False})
+        self.service.credentials(Path('auth.json'))
+        self.service.vault.save.assert_not_called()
+
     def test_failed_relogin_marks_account_for_removal_and_clears_credentials(self):
         self.info.return_value = {'logged_in': False}
         self.login.side_effect = ValueError('认证失败')

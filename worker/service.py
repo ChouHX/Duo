@@ -75,6 +75,10 @@ class Service:
                 raise ValueError('请输入密码。')
             self.password = value['password']
             self.remember = value.get('remember') is True
+            # 拿到密码立即按用户选择写入系统凭据保险库：官网维护/5xx/429 时登录会失败，
+            # 如果只等到整次操作成功才保存，用户每次重试都要重输密码。真正的认证失败
+            # （密码错误 -20101 或账号失效）会由 cleanup_credentials 删除这份保存的密码。
+            self.persist_password()
         return self.account, self.password
 
     def text(self, label, default=''):
