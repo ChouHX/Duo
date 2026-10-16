@@ -53,8 +53,12 @@ jobs:
       - run: python scripts/smoke_worker.py
       - run: pnpm build
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
-      - name: Install Playwright browser
+      - name: Install Playwright browser (Linux)
+        if: runner.os == 'Linux'
         run: pnpm exec playwright install --with-deps chromium
+      - name: Install Playwright browser
+        if: runner.os != 'Linux'
+        run: pnpm exec playwright install chromium
       - run: pnpm test:ui
       - run: pnpm bundle
       - if: runner.os == 'macOS'
