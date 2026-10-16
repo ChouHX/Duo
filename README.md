@@ -1,8 +1,8 @@
 # DUO Killer · iPhone DUO 抢购辅助与 Apple 商城快速下单
 
-面向 **iPhone DUO 抢购准备与快速下单** 的 Apple 中国在线商店辅助工具，支持 **macOS、Windows 和本地 Web**。提前配置账号、商品 SKU、购买数量和收货地址，在同一个界面完成登录检查、加入购物袋、结账确认、生成付款二维码和订单查询。
+面向 **iPhone DUO 抢购准备与快速下单** 的 Apple 中国在线商店辅助工具，支持 **macOS、Windows、Linux 和本地 Web**。提前配置账号、商品 SKU、购买数量和收货地址，在同一个界面完成登录检查、加入购物袋、结账确认、生成付款二维码和订单查询。
 
-iPhone DUO launch assistant and Apple Store quick checkout tool for macOS, Windows and local Web. Built with Tauri, Rust, React and Python.
+iPhone DUO launch assistant and Apple Store quick checkout tool for macOS, Windows, Linux and local Web. Built with Tauri, Rust, React and Python.
 
 ## 主要功能
 
@@ -28,13 +28,14 @@ GitHub README 不支持内嵌 B 站播放器，点击上方链接观看完整视
 
 ## 支持平台
 
-| 版本    | 使用方式                                          |
-| ------- | ------------------------------------------------- |
-| macOS   | 打开 `.app` 应用                                  |
-| Windows | 打开便携目录中的 `.exe`                           |
-| Web     | 在 macOS / Windows 本机启动服务，用默认浏览器操作 |
+| 版本    | 使用方式                                                     |
+| ------- | ------------------------------------------------------------ |
+| macOS   | 打开 `.dmg` 安装包，或直接打开构建出的 `.app` 应用           |
+| Windows | 运行 `.exe` / `.msi` 安装包，或打开便携目录中的 `.exe`        |
+| Linux   | 安装 `.deb`，或直接运行 `.AppImage`（x86_64）                 |
+| Web     | 在 macOS / Windows 本机启动服务，用默认浏览器操作            |
 
-Web 版不是在线网站。首次登录获取浏览器上下文时，需要安装 Chrome 或 Edge。已构建版本内置 Python 和依赖；Windows 桌面版还需要 WebView2。
+Web 版不是在线网站。首次登录获取浏览器上下文时，需要安装 Chrome 或 Edge。已构建版本内置 Python 和依赖；Windows 桌面版还需要 WebView2，Linux 桌面版需要系统提供 WebKitGTK（安装包会自动声明依赖）。Linux 上没有系统凭据保险库，因此**不支持“保存密码”**，每次登录需重新输入密码；设备信任与登录会话照常生效。
 
 ## 快速启动（Web）
 
@@ -43,8 +44,8 @@ Web 版不是在线网站。首次登录获取浏览器上下文时，需要安�
 克隆仓库后启动：
 
 ```sh
-git clone https://github.com/Jasper-zzq/iPhoneDuo.git
-cd iPhoneDuo
+git clone https://github.com/ChouHX/Duo.git
+cd Duo
 pnpm install --frozen-lockfile
 pnpm dev:web
 ```
@@ -174,7 +175,7 @@ pnpm desktop
 
 ## 构建
 
-在目标系统及对应架构上构建，不能直接把 Mac 产物拿到 Windows 使用。先准备上述开发环境。
+在目标系统及对应架构上构建，不能把 macOS / Windows / Linux 的产物拿到别的系统使用。先准备上述开发环境。
 
 ### macOS
 
@@ -185,7 +186,12 @@ pnpm worker:build
 pnpm bundle
 ```
 
-输出：`src-tauri/target/release/bundle/macos/DUO Killer.app`。
+输出（都在 `src-tauri/target/release/bundle/` 下）：
+
+| 产物               | 路径                                        | 说明                                                        |
+| ------------------ | ------------------------------------------- | ----------------------------------------------------------- |
+| **安装包（推荐）** | `dmg/DUO Killer_0.1.0_aarch64.dmg`          | 拖入“应用程序”安装；Apple Silicon 为 `aarch64`，Intel 为 `x64` |
+| 应用本体           | `macos/DUO Killer.app`                      | 可直接双击运行；分享时需保留整个 `.app`                     |
 
 当前构建未配置发行签名和公证。若首次打开提示无法验证开发者，确认来源可信后，先尝试打开一次，再到 **系统设置 → 隐私与安全性 → 仍要打开**，确认“打开”。此方法针对未认证开发者提示；不要忽略恶意软件或损坏警告。参见 [Apple 官方说明](https://support.apple.com/zh-cn/102445)。
 
@@ -232,6 +238,33 @@ pnpm bundle                # 构建并生成安装包（nsis + msi）与免安�
 >
 > 当前构建**未配置代码签名**：首次运行 `setup.exe` 或应用时可能出现 SmartScreen“Windows 已保护你的电脑”提示，确认来源可信后点“更多信息 → 仍要运行”。
 
+### Linux
+
+在 Ubuntu 22.04 / Debian 等发行版上安装构建依赖（其它发行版用对应的包名）：
+
+```sh
+sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+  libxdo-dev libssl-dev patchelf file libfuse2
+```
+
+然后：
+
+```sh
+pnpm install --frozen-lockfile
+pnpm worker:setup          # 建 .venv 与运行依赖
+pnpm worker:build          # PyInstaller 打包 worker 到 src-tauri/resources/worker
+pnpm bundle                # 构建并生成 deb + AppImage
+```
+
+输出（都在 `src-tauri/target/release/bundle/` 下）：
+
+| 产物               | 路径                                       | 说明                                                          |
+| ------------------ | ------------------------------------------ | ------------------------------------------------------------- |
+| **安装包（推荐）** | `deb/DUO Killer_0.1.0_amd64.deb`           | 双击或 `sudo apt install ./…deb` 安装（命名以实际构建为准）    |
+| 免安装             | `appimage/DUO Killer_0.1.0_amd64.AppImage` | `chmod +x` 后直接运行，无需安装（依赖系统 WebKitGTK）          |
+
+> 打包产物与目标架构绑定：在 x86_64 机器上产出 `amd64`，不要在 macOS / Windows 上交叉构建。Linux 上同样不保存密码（无系统凭据保险库），登录时按提示输入密码即可。
+
 ### 构建 Web 版
 
 在 macOS 或 Windows 的项目目录执行：
@@ -241,7 +274,7 @@ pnpm install --frozen-lockfile
 pnpm build:web
 ```
 
-输出：`local-web-release/`，复制整个目录给相同系统和架构的电脑使用。项目也提供 [桌面构建 CI](.github/workflows/build.yml) 和 [Web 构建 CI](.github/workflows/local-web.yml)。
+输出：`local-web-release/`，复制整个目录给相同系统和架构的电脑使用。项目也提供 [桌面构建 CI](.github/workflows/build.yml)（覆盖 **macOS ARM / macOS Intel / Windows x64 / Linux x64**）和 [Web 构建 CI](.github/workflows/local-web.yml)（macOS / Windows）；推送 `v*` 标签或手动触发即可在 Actions 的 Artifacts 里下载各平台安装包。
 
 ## 隐私与免责声明
 
