@@ -331,6 +331,9 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(any(str(p).endswith('chrome.exe') for p in win))
         self.assertTrue(any(str(p).endswith('msedge.exe') for p in win))
         self.assertTrue(any(str(p).endswith('Google Chrome') for p in browser_candidates('darwin')))
+        linux=[str(p).replace('\\','/') for p in browser_candidates('linux',{})]
+        self.assertTrue(any(p.endswith('google-chrome') or p.endswith('chromium') for p in linux))
+        self.assertTrue(any(p.startswith('/opt/google/chrome') for p in linux))
 
     def test_confirmation_requires_a_true_boolean(self):
         from unittest.mock import Mock

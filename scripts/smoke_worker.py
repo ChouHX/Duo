@@ -16,7 +16,9 @@ with tempfile.TemporaryDirectory() as folder:
         process.stdin.flush()
         event=json.loads(process.stdout.readline())
         assert event['type']=='result', event
-        assert event['result']=={'success':True,'config':{}}, event
+        # address_read 会带上 inherited 等附带字段，只校验核心结果。
+        assert event['result'].get('success') is True, event
+        assert event['result'].get('config')=={}, event
         assert process.wait(timeout=20)==0, process.stderr.read()
         print('内置业务进程检查通过；无网络请求。')
     finally:

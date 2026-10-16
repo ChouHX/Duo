@@ -274,7 +274,7 @@ pnpm install --frozen-lockfile
 pnpm build:web
 ```
 
-输出：`local-web-release/`，复制整个目录给相同系统和架构的电脑使用。项目也提供 [桌面构建 CI](.github/workflows/build.yml)（覆盖 **macOS ARM / macOS Intel / Windows x64 / Linux x64**）和 [Web 构建 CI](.github/workflows/local-web.yml)（macOS / Windows）；推送 `v*` 标签或手动触发即可在 Actions 的 Artifacts 里下载各平台安装包。
+输出：`local-web-release/`，复制整个目录给相同系统和架构的电脑使用。项目提供 [桌面构建 CI](.github/workflows/build.yml)（覆盖 **macOS ARM / macOS Intel / Windows x64 / Linux x64**）；推送 `v*` 标签或手动触发即可在 Actions 的 Artifacts 里下载各平台安装包。
 
 ## 隐私与免责声明
 
