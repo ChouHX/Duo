@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from duo_killer import Checkout, main
 import duo_killer
@@ -107,7 +107,52 @@ class CheckoutOptionsTests(unittest.TestCase):
         self.output.__enter__()
         self.addCleanup(self.output.__exit__, None, None, None)
 
+    def test_account_config_inherits_general_preset(self):
+        data = Path(self.temp.name) / "data"
+        general = data / "settings" / "checkout.json"
+        account = data / "accounts" / "abc" / "checkout.json"
+        account.parent.mkdir(parents=True)
+        general.parent.mkdir(parents=True)
+        options.save_config(general, {**deepcopy(CONFIG), "auto_checkout": True})
+        options.save_config(account, {"address": {"street": "账号自己的街道 2 号"}})
+        merged = options.read_config(account)
+        # 账号自己填过的字段优先，其余从通用预设继承。
+        self.assertEqual(merged["address"]["street"], "账号自己的街道 2 号")
+        self.assertEqual(merged["delivery"], CONFIG["delivery"])
+        self.assertEqual(merged["contact"], CONTACT)
+        self.assertTrue(merged["auto_checkout"])
+        # 落盘的账号配置不被改写，写回时也只写账号自己的字段。
+        self.assertEqual(options.read_config(account, defaults=False), {"address": {"street": "账号自己的街道 2 号"}})
+        # 通用预设自身不回退，读到的就是文件内容。
+        self.assertEqual(options.read_config(general), options.read_config(general, defaults=False))
+
+    def test_auto_checkout_uses_local_preset_without_prompting(self):
+        general = Path(self.temp.name) / "data" / "settings" / "checkout.json"
+        account = general.parent.parent / "accounts" / "abc" / "checkout.json"
+        account.parent.mkdir(parents=True)
+        general.parent.mkdir(parents=True)
+        options.save_config(general, {**deepcopy(CONFIG), "auto_checkout": True})
+        options.save_config(account, {"address": {"street": "账号自己的街道 2 号"}})
+        flow = FakeFlow(shipping_model())
+        with patch("builtins.input", side_effect=AssertionError("全自动下单不应询问地址来源")),                 patch.object(options, "configure_address", side_effect=AssertionError("地址已完整，不应交互补全")):
+            options.shipping(flow, account, auto=True)
+        payload = flow.calls[-1][2]
+        prefix = "checkout.shipping.addressSelector.newAddress"
+        self.assertEqual(payload["checkout.shipping.addressSelector.selectAddress"], "newAddr")
+        self.assertEqual(payload[prefix + ".address.street"], "账号自己的街道 2 号")
+        # 联系人/手机号来自通用预设。
+        self.assertEqual(payload[prefix + ".address.copyContact.fullDaytimePhone"], CONTACT["fullDaytimePhone"])
+
+    def test_auto_checkout_without_auto_flag_still_asks(self):
+        flow = FakeFlow(shipping_model())
+        with patch("builtins.input", return_value="") as prompt:
+            options.shipping(flow, self.path)
+        prompt.assert_called_once()  # 未开启全自动时保持原行为
+
     def test_mixed_pickup_follows_har_and_keeps_required_delivery(self):
+        config = deepcopy(CONFIG)
+        config['auto_checkout'] = False
+        options.save_config(self.path, config)
         flow = FakeFlow(fulfillment_model())
         with patch('builtins.input', side_effect=['2', '', '1', '']):
             options.fulfillment(flow, self.path)
@@ -124,6 +169,9 @@ class CheckoutOptionsTests(unittest.TestCase):
         self.assertEqual(flow.model['checkout']['d']['page'], 'Billing')
 
     def test_home_and_saved_address(self):
+        config = deepcopy(CONFIG)
+        config['auto_checkout'] = False
+        options.save_config(self.path, config)
         flow = FakeFlow(fulfillment_model())
         with patch('builtins.input', side_effect=['', '']):
             options.fulfillment(flow, self.path)
@@ -132,6 +180,9 @@ class CheckoutOptionsTests(unittest.TestCase):
         self.assertFalse(any('pickup' in key for key in flow.calls[0][2]))
 
     def test_selected_delivery_time_is_sent_in_continuation(self):
+        config = deepcopy(CONFIG)
+        config['auto_checkout'] = False
+        options.save_config(self.path, config)
         model = fulfillment_model()
         path = 'checkout.fulfillment.deliveryTab.delivery.shipmentGroups.group.shipmentOptionsGroups.option.shippingOptions'
         options.value(model, path)['d']['options'] = [
@@ -144,6 +195,9 @@ class CheckoutOptionsTests(unittest.TestCase):
         self.assertEqual(flow.calls[-1][2][path + '.selectShippingOption'], 'TD')
 
     def test_pure_pickup_skips_shipping_address(self):
+        config = deepcopy(CONFIG)
+        config['auto_checkout'] = False
+        options.save_config(self.path, config)
         flow = FakeFlow(fulfillment_model(mixed=False), mixed=False)
         with patch('builtins.input', side_effect=['2', '', '1']):
             options.fulfillment(flow, self.path)
@@ -258,6 +312,7 @@ class CheckoutOptionsTests(unittest.TestCase):
     def test_delivery_region_prefers_api_even_if_local_region_differs(self):
         config = deepcopy(CONFIG)
         config['delivery'] = {'state': '上海', 'city': '上海', 'district': '浦东新区'}
+        config['auto_checkout'] = False
         options.save_config(self.path, config)
         flow = FakeFlow(fulfillment_model())
         with patch('builtins.input', return_value='') as prompt:
@@ -266,6 +321,151 @@ class CheckoutOptionsTests(unittest.TestCase):
         payload = flow.calls[-1][2]
         district = next(val for key, val in payload.items() if key.endswith('.district'))
         self.assertEqual(district, '锦江区')
+
+    def test_auto_checkout_skips_delivery_prompts(self):
+        config = deepcopy(CONFIG)
+        config['auto_checkout'] = True
+        options.save_config(self.path, config)
+        flow = FakeFlow(fulfillment_model())
+        with patch('builtins.input', side_effect=AssertionError('全自动不应询问')):
+            options.fulfillment(flow, self.path)
+        payload = flow.calls[-1][2]
+        self.assertEqual(
+            payload['checkout.fulfillment.fulfillmentOptions.selectFulfillmentLocation'], 'HOME')
+
+    def test_auto_checkout_inherited_from_general_preset(self):
+        general = Path(self.temp.name) / "data" / "settings" / "checkout.json"
+        account = general.parent.parent / "accounts" / "abc" / "checkout.json"
+        account.parent.mkdir(parents=True)
+        general.parent.mkdir(parents=True)
+        options.save_config(general, {**deepcopy(CONFIG), "auto_checkout": True})
+        options.save_config(account, {})
+        flow = FakeFlow(fulfillment_model())
+        with patch("builtins.input", side_effect=AssertionError("继承的通用预设开启了全自动，不应询问")):
+            options.fulfillment(flow, account)
+        self.assertEqual(
+            flow.calls[-1][2]["checkout.fulfillment.fulfillmentOptions.selectFulfillmentLocation"], "HOME")
+
+    def test_saved_delivery_method_forces_home_without_prompt(self):
+        config = deepcopy(CONFIG)
+        config['store'] = {'id': 'R580', 'name': '测试门店', 'city': '成都'}
+        config['delivery_method'] = 'delivery'
+        options.save_config(self.path, config)
+        flow = FakeFlow(fulfillment_model())
+        with patch('builtins.input', side_effect=AssertionError('已选择快递配送，不应询问收货方式')):
+            options.fulfillment(flow, self.path)
+        self.assertEqual(
+            flow.calls[-1][2]['checkout.fulfillment.fulfillmentOptions.selectFulfillmentLocation'], 'HOME')
+        self.assertFalse(any('pickup' in key for key in flow.calls[-1][2]))
+
+    def test_saved_delivery_method_forces_pickup_without_prompt(self):
+        config = deepcopy(CONFIG)
+        config['store'] = {'id': 'R580', 'name': '测试门店', 'city': '成都'}
+        config['delivery_method'] = 'pickup'
+        options.save_config(self.path, config)
+        flow = FakeFlow(fulfillment_model())
+        with patch('builtins.input', side_effect=AssertionError('已选择门店自提，不应询问收货方式')):
+            options.fulfillment(flow, self.path)
+        self.assertEqual(
+            flow.calls[0][2]['checkout.fulfillment.fulfillmentOptions.selectFulfillmentLocation'], 'RETAIL')
+        self.assertIn('continueFromFulfillmentToPickupContact', [name for _, name, _ in flow.calls])
+        locator = 'checkout.fulfillment.pickupTab.pickup.storeLocator'
+        selected = next(payload[locator + '.selectStore'] for _, name, payload in flow.calls if name == 'select')
+        self.assertEqual(selected, 'R580')
+
+    def test_unavailable_delivery_method_falls_back(self):
+        # 官网只提供自提时，即使预设是快递配送也自动改用自提，不报错。
+        config = deepcopy(CONFIG)
+        config['store'] = {'id': 'R580', 'name': '测试门店', 'city': '成都'}
+        config['delivery_method'] = 'delivery'
+        options.save_config(self.path, config)
+        model = fulfillment_model(mixed=False)
+        delivery = model['checkout']['fulfillment']['fulfillmentOptions']['d']
+        for option in delivery['options']:
+            if option['value'] == 'HOME':
+                option['disabled'] = True
+        flow = FakeFlow(model, mixed=False)
+        with patch('builtins.input', side_effect=AssertionError('应自动改用可用方式')):
+            options.fulfillment(flow, self.path)
+        self.assertEqual(
+            flow.calls[0][2]['checkout.fulfillment.fulfillmentOptions.selectFulfillmentLocation'], 'RETAIL')
+        self.assertIn('continueFromFulfillmentToPickupContact', [name for _, name, _ in flow.calls])
+
+    def test_apply_preset_copies_the_general_preset_into_the_account(self):
+        general = Path(self.temp.name) / "data" / "settings" / "checkout.json"
+        account = general.parent.parent / "accounts" / "abc" / "checkout.json"
+        account.parent.mkdir(parents=True)
+        general.parent.mkdir(parents=True)
+        options.save_config(general, {
+            "contact": deepcopy(CONTACT),
+            "delivery": {"state": "四川", "city": "成都", "district": "锦江区"},
+            "address": {"street": "通用预设路 1 号"},
+            "delivery_method": "pickup",
+            "store": {"id": "R580", "name": "通用门店"},
+            "applecare": True,
+            "auto_checkout": True,
+        })
+        options.save_config(account, {"address": {"street": "账号自己的路 2 号"}})
+        applied = options.apply_preset(account)
+        self.assertEqual(applied["address"]["street"], "通用预设路 1 号")
+        self.assertEqual(applied["delivery_method"], "pickup")
+        self.assertEqual(applied["store"]["id"], "R580")
+        self.assertTrue(applied["applecare"])
+        self.assertEqual(json.loads(account.read_text(encoding="utf-8")), applied)
+
+    def test_apply_preset_rejects_empty_general_preset(self):
+        general = Path(self.temp.name) / "data" / "settings" / "checkout.json"
+        account = general.parent.parent / "accounts" / "abc" / "checkout.json"
+        account.parent.mkdir(parents=True)
+        general.parent.mkdir(parents=True)
+        options.save_config(account, {"address": {"street": "账号自己的路 2 号"}})
+        # 通用预设文件存在但为空。
+        options.save_config(general, {})
+        with self.assertRaisesRegex(ValueError, "通用预设还是空的"):
+            options.apply_preset(account)
+        general.unlink()
+        with self.assertRaisesRegex(ValueError, "通用预设不可用"):
+            options.apply_preset(account)
+
+    def test_auto_shipping_uses_default_without_prompt(self):
+        flow = FakeFlow(shipment())
+        groups = 'shipmentGroups'
+        node = flow.require(groups + '.group.shipmentOptionsGroups.option.shippingOptions')['d']
+        node['options'] = [{'value': 'A8', 'label': '标准配送'},
+                           {'value': 'A1', 'label': '加急配送'}]
+        node['selectShippingOption'] = 'A8'
+        with patch('builtins.input', side_effect=AssertionError('全自动不应询问')):
+            payload = options.shipping_options(flow, groups, auto=True)
+        key = groups + '.group.shipmentOptionsGroups.option.shippingOptions.selectShippingOption'
+        self.assertEqual(payload[key], 'A8')
+
+    def test_preset_store_prefers_pickup_without_prompt(self):
+        config = deepcopy(CONFIG)
+        config['store'] = {'id': 'R580', 'name': '测试门店', 'city': '成都'}
+        config['auto_checkout'] = True
+        options.save_config(self.path, config)
+        flow = FakeFlow(fulfillment_model())
+        with patch('builtins.input', side_effect=AssertionError('预设门店不应询问')):
+            options.fulfillment(flow, self.path)
+        modes = [call[2].get('checkout.fulfillment.fulfillmentOptions.selectFulfillmentLocation')
+                 for call in flow.calls if call[2]]
+        selected = [call[2].get('checkout.fulfillment.pickupTab.pickup.storeLocator.selectStore')
+                    for call in flow.calls if call[2]]
+        self.assertIn('RETAIL', modes)
+        self.assertIn('R580', selected)
+
+    def test_preset_store_defaults_to_pickup(self):
+        config = deepcopy(CONFIG)
+        config['store'] = {'id': 'R580', 'name': '测试门店'}
+        config['auto_checkout'] = False
+        options.save_config(self.path, config)
+        flow = FakeFlow(fulfillment_model())
+        with patch('builtins.input', return_value='') as prompt:
+            options.fulfillment(flow, self.path)
+        prompt.assert_called_once()  # 仅收货方式，回车接受默认（自提）。
+        modes = [call[2].get('checkout.fulfillment.fulfillmentOptions.selectFulfillmentLocation')
+                 for call in flow.calls if call[2]]
+        self.assertIn('RETAIL', modes)
 
     def test_region_change_uses_returned_options_and_does_not_send_old_children(self):
         flow = FakeFlow({'region': deepcopy(REGION)})
@@ -309,9 +509,13 @@ class CheckoutOptionsTests(unittest.TestCase):
             options.pickup_contact(flow, deepcopy(CONFIG), self.path)
         self.assertEqual(flow.calls, [])
 
-    def test_store_menu_can_switch_to_delivery_with_saved_api_address(self):
+    def test_pickup_auto_selects_nearest_available_store(self):
+        # 三种情况都不再询问门店：有货就近选第一家；全禁用或没有门店则改用送货。
         for availability in ('available', 'disabled', 'empty'):
             with self.subTest(availability=availability):
+                config = deepcopy(CONFIG)
+                config['store'] = {'id': '', 'name': '', 'state': '四川', 'city': '成都', 'district': '锦江区'}
+                options.save_config(self.path, config)
                 model = fulfillment_model()
                 stores = options.value(model, 'checkout.fulfillment.pickupTab.pickup.storeLocator.searchResults.d.retailStores')
                 if availability == 'disabled':
@@ -322,37 +526,110 @@ class CheckoutOptionsTests(unittest.TestCase):
                 flow = FakeFlow(model)
                 # 搜索之后切换配送必须读取服务器更新后的配送模型。
                 original_action = flow.action
+
                 def action(module, name, data=None):
                     original_action(module, name, data)
                     if name == 'selectFulfillmentLocationAction' and data[module + '.selectFulfillmentLocation'] == 'HOME':
                         shipping_path = 'checkout.fulfillment.deliveryTab.delivery.shipmentGroups.group.shipmentOptionsGroups.option.shippingOptions'
                         flow.require(shipping_path)['d'] = {'selectShippingOption': 'NEW', 'options': [{'value': 'NEW'}]}
+
                 flow.action = action
-                with patch('builtins.input', side_effect=['2', '', '2' if availability == 'available' else '', '1']) as prompt, \
+                with patch('builtins.input', side_effect=AssertionError('就近自提不需要用户选择门店')) as prompt, \
                         contextlib.redirect_stdout(io.StringIO()) as output:
                     options.fulfillment(flow, self.path)
-                    options.shipping(flow, self.path)
-                self.assertEqual(prompt.call_count, 4)
-                self.assertIn('为我送货（不选门店，改为配送）', output.getvalue())
-                self.assertEqual([name for _, name, _ in flow.calls], [
-                    'selectFulfillmentLocationAction', 'search', 'selectFulfillmentLocationAction',
-                    'continueFromFulfillmentToShipping', 'continueFromShippingToBilling'])
-                payload = flow.calls[3][2]
-                self.assertEqual(payload['checkout.fulfillment.fulfillmentOptions.selectFulfillmentLocation'], 'HOME')
-                self.assertTrue(any(k.endswith('.selectShippingOption') and v == 'NEW' for k, v in payload.items()))
-                self.assertFalse(any('pickup' in k or 'selectStore' in k or 'searchInput' in k for k in payload))
-                self.assertEqual(flow.calls[-1][2]['checkout.shipping.addressSelector.selectAddress'], 'address-0')
+                    options.shipping(flow, self.path, auto=True)
+                prompt.assert_not_called()
+                names = [name for _, name, _ in flow.calls]
+                if availability == 'available':
+                    self.assertEqual(names, ['selectFulfillmentLocationAction', 'search', 'select',
+                                             'continueFromFulfillmentToPickupContact',
+                                             'continueFromPickupContactToShipping', 'continueFromShippingToBilling'])
+                    self.assertEqual(flow.calls[2][2]['checkout.fulfillment.pickupTab.pickup.storeLocator.selectStore'], 'R580')
+                    self.assertIn('就近自提：自动选择', output.getvalue())
+                else:
+                    self.assertEqual(names, ['selectFulfillmentLocationAction', 'search',
+                                             'selectFulfillmentLocationAction',
+                                             'continueFromFulfillmentToShipping', 'continueFromShippingToBilling'])
+                    payload = flow.calls[3][2]
+                    self.assertEqual(payload['checkout.fulfillment.fulfillmentOptions.selectFulfillmentLocation'], 'HOME')
+                    self.assertTrue(any(k.endswith('.selectShippingOption') and v == 'NEW' for k, v in payload.items()))
+                    self.assertFalse(any('selectStore' in k or 'searchInput' in k for k in payload))
+                # 全自动：直接用本地快捷地址结账。
+                self.assertEqual(flow.calls[-1][2]['checkout.shipping.addressSelector.selectAddress'], 'newAddr')
                 self.assertEqual(flow.model['checkout']['d']['page'], 'Billing')
 
+    def test_pickup_search_switches_to_the_preset_region_first(self):
+        # 官网只按自提页当前地区返回门店：必须先切到预设地区再搜索，否则"就近"是错的。
+        config = deepcopy(CONFIG)
+        config['delivery_method'] = 'pickup'
+        config['store'] = {'state': '湖北', 'city': '武汉', 'district': '江汉区'}
+        options.save_config(self.path, config)
+        model = fulfillment_model(mixed=False)
+        selector = ('checkout.fulfillment.pickupTab.pickup.storeLocator'
+                    '.address.stateCitySelectorForCheckout')
+        node = options.value(model, selector)['d']
+        node['stateOptions'] = [{'value': '湖北', 'label': '湖北'}, {'value': '四川', 'label': '四川'}]
+        node['cityOptions'] = [{'value': '武汉', 'label': '武汉'}]
+        node['districtOptions'] = [{'value': '江汉区', 'label': '江汉区'}]
+        flow = FakeFlow(model, mixed=False)
+        with patch('builtins.input', side_effect=AssertionError('全自动不应询问')),                 contextlib.redirect_stdout(io.StringIO()):
+            note = options.fulfillment(flow, self.path)
+        self.assertEqual([payload[selector + '.state'] for _, name, payload in flow.calls
+                          if name == 'Selectstate'], ['湖北'])
+        search = next(payload for _, name, payload in flow.calls if name == 'search')
+        locator = 'checkout.fulfillment.pickupTab.pickup.storeLocator'
+        self.assertEqual(search[locator + '.searchInput'], '武汉')
+        self.assertEqual(search[selector + '.city'], '武汉')
+        self.assertEqual(search[selector + '.district'], '江汉区')
+        self.assertIn('测试门店', note)
+
+    def test_pickup_region_mismatch_never_prompts(self):
+        # 全自动下单不能停在"请选择序号"上：地区匹配不上就沿用官网当前值。
+        config = deepcopy(CONFIG)
+        config['delivery_method'] = 'pickup'
+        config['store'] = {'state': '火星', 'city': '环形山', 'district': '一号坑'}
+        options.save_config(self.path, config)
+        flow = FakeFlow(fulfillment_model(mixed=False))
+        with patch('builtins.input', side_effect=AssertionError('全自动不应询问')),                 contextlib.redirect_stdout(io.StringIO()):
+            options.fulfillment(flow, self.path)
+        self.assertFalse([name for _, name, _ in flow.calls if name.startswith('Select')])
+        search = next(payload for _, name, payload in flow.calls if name == 'search')
+        self.assertEqual(search['checkout.fulfillment.pickupTab.pickup.storeLocator.searchInput'], '环形山')
+
+    def test_pickup_without_available_store_returns_a_delivery_note(self):
+        config = deepcopy(CONFIG)
+        config['delivery_method'] = 'pickup'
+        config['store'] = {'state': '四川', 'city': '成都', 'district': '锦江区'}
+        options.save_config(self.path, config)
+        model = fulfillment_model()
+        stores = options.value(model, 'checkout.fulfillment.pickupTab.pickup.storeLocator.searchResults.d.retailStores')
+        for store in stores:
+            store['storeDisabled'] = True
+        flow = FakeFlow(model)
+        with contextlib.redirect_stdout(io.StringIO()):
+            note = options.fulfillment(flow, self.path)
+        self.assertIn('没有', note)
+        self.assertIn('已改为快递配送', note)
+
     def test_rejected_switch_to_delivery_stops_before_continuation(self):
-        flow = FakeFlow(fulfillment_model())
+        # 该地区没有可选门店 → 请求改为送货；服务端若拒绝切换就必须停下来。
+        config = deepcopy(CONFIG)
+        config['store'] = {'id': '', 'name': '', 'state': '四川', 'city': '成都', 'district': '锦江区'}
+        options.save_config(self.path, config)
+        model = fulfillment_model()
+        stores = options.value(model, 'checkout.fulfillment.pickupTab.pickup.storeLocator.searchResults.d.retailStores')
+        for store in stores:
+            store['storeDisabled'] = True
+        flow = FakeFlow(model)
         original_action = flow.action
+
         def action(module, name, data=None):
             if name == 'selectFulfillmentLocationAction' and data[module + '.selectFulfillmentLocation'] == 'HOME':
                 return  # 服务端拒绝切换，仍然返回 RETAIL。
             original_action(module, name, data)
+
         flow.action = action
-        with patch('builtins.input', side_effect=['2', '', '2']), \
+        with contextlib.redirect_stdout(io.StringIO()), \
                 self.assertRaisesRegex(ValueError, '未确认切换为送货'):
             options.fulfillment(flow, self.path)
         self.assertFalse(any(name.startswith('continue') for _, name, _ in flow.calls))
@@ -364,7 +641,7 @@ class CheckoutOptionsTests(unittest.TestCase):
         for store in stores:
             store['storeDisabled'] = True
         flow = FakeFlow(model)
-        with patch('builtins.input', side_effect=['1', '']), self.assertRaisesRegex(ValueError, '没有可选项'):
+        with self.assertRaisesRegex(ValueError, '都没有可选的自提门店'):
             options.fulfillment(flow, self.path)
         self.assertEqual([n for _, n, _ in flow.calls], ['selectFulfillmentLocationAction', 'search'])
 
@@ -497,17 +774,159 @@ class CheckoutOptionsTests(unittest.TestCase):
             options.configure_address(self.path)
         self.assertEqual(options.read_config(self.path)['delivery'], CONFIG['delivery'])
 
-    def test_region_api_ignores_server_default_and_handles_network_failure(self):
+    def test_region_lookup_uses_apple_address_even_when_it_is_the_default(self):
         import requests
         for default_location in (True, False):
-            with self.subTest(default_location=default_location), patch.object(requests.Session, 'get') as get:
+            with self.subTest(default_location=default_location), \
+                    patch.object(requests.Session, 'get') as get:
+                get.return_value.is_redirect = False
                 get.return_value.json.return_value = {'head': {'status': '200'}, 'body': {'content': {
-                    'defaultLocation': default_location, 'address': {**CONFIG['delivery'], 'street': 'must-not-use'}}}}
-                result = options.current_region(self.path.parent / 'auth.json')
-                self.assertEqual(result, {} if default_location else CONFIG['delivery'])
-                self.assertEqual(get.call_args.kwargs, {'timeout': (3, 5), 'allow_redirects': False})
+                    'defaultLocation': default_location,
+                    'address': {**CONFIG['delivery'], 'street': 'must-not-use'}}}}
+                region, note = options.current_region_detail(self.path.parent / 'auth.json')
+                self.assertEqual(region, CONFIG['delivery'])
+                self.assertIn('已读取官网地区', note)
+                self.assertNotIn('street', region)
+                self.assertEqual(get.call_args.kwargs['timeout'], (3, 8))
+                self.assertFalse(get.call_args.kwargs['allow_redirects'])
+
+    def test_account_region_reads_saved_address_and_options(self):
+        selector = options.EDIT_SELECTOR
+        model = {}
+        node = model
+        for part in selector.split('.'):
+            node = node.setdefault(part, {})
+        node['d'] = {'stateOptions': [{'value': '四川', 'label': '四川'}]}
+        cursor = model
+        for part in 'home.customerAccount.shippingInfo.shippingAddress'.split('.'):
+            cursor = cursor.setdefault(part, {})
+        cursor['d'] = {'state': 'SC', 'city': '成都, ', 'street': '圣经路', 'street2': '',
+                       'lastName': '张', 'firstName': 'Q', 'fullDaytimePhone': '18109038858'}
+        session = Mock()
+        flow = Mock()
+        flow.model = model
+        with patch.object(options, '_account_flow', return_value=(session, flow)):
+            detail = options.account_region(Path('auth.json'))
+        self.assertEqual(detail['region'], {'state': '四川', 'city': '成都'})
+        self.assertEqual(detail['contact']['lastName'], '张')
+        self.assertEqual(detail['address']['street'], '圣经路')
+        self.assertEqual(detail['states'][0]['value'], '四川')
+        self.assertTrue(detail['saved'])
+        session.close.assert_called_once()
+
+    def test_account_region_options_returns_city_options(self):
+        selector = options.EDIT_SELECTOR
+        model = {}
+        node = model
+        for part in selector.split('.'):
+            node = node.setdefault(part, {})
+        node['d'] = {'stateOptions': [{'value': '四川', 'label': '四川'}],
+                     'cityOptions': [{'value': '成都', 'label': '成都'}]}
+        session, flow = Mock(), Mock()
+        flow.model = model
+        with patch.object(options, 'lookup_regions', side_effect=ValueError('离线')),                 patch.object(options, '_account_flow', return_value=(session, flow)):
+            cities = options.account_region_options(Path('a.json'), 'city', '四川')
+        self.assertEqual(cities[0]['value'], '成都')
+        flow.action.assert_called_once()
+        session.close.assert_called_once()
+
+    def test_lookup_regions_reads_address_lookup(self):
+        cases = {
+            (): ('state', {}),
+            ('山东',): ('city', {'state': '山东'}),
+            ('山东', '济南'): ('district', {'state': '山东', 'city': '济南'}),
+        }
+        for args, (level, params) in cases.items():
+            with self.subTest(level=level):
+                response = Mock()
+                response.status_code = 200
+                response.json.return_value = {'body': {level: {'data': [{'label': '选项', 'value': 'V'}]}}}
+                with patch.object(options.requests, 'get', return_value=response) as get:
+                    rows = options.lookup_regions(*args)
+                self.assertEqual(rows, [{'value': 'V', 'label': '选项'}])
+                self.assertEqual(get.call_args.kwargs.get('params', {}), params)
+
+    def test_address_lookup_failure_is_reported(self):
+        response = Mock()
+        response.status_code = 541
+        with patch.object(options.requests, 'get', return_value=response):
+            with self.assertRaisesRegex(ValueError, '541'):
+                options.lookup_regions('山东')
+
+    def test_store_search_messages_maps_pickup_availability(self):
+        payload = {'body': {'content': {'pickupMessage': {'stores': [
+            {'storeNumber': 'R648', 'storeName': '济南恒隆广场', 'city': '济南', 'state': '山东',
+             'partsAvailability': {'MK2U4CH/A': {'pickupDisplay': 'available', 'pickupSearchQuote': '今天可取货',
+                                                 'messageTypes': {'regular': {'storePickupProductTitle': 'iPhone Duo'}}}}},
+            {'storeNumber': 'R1', 'storeName': '无货门店', 'city': '济南', 'state': '山东',
+             'partsAvailability': {'MK2U4CH/A': {'pickupDisplay': 'unavailable'}}}]}}}}
+
+        class FakePage:
+            def evaluate(self, _script, _url):
+                return {'status': 200, 'data': payload}
+
+        context = contextlib.nullcontext(FakePage())
+        with patch('apple_login.open_browser_page', return_value=context):
+            stores = options.store_search_messages(Path('a.json'), '山东', '济南', '历下区', 'MK2U4CH/A')
+        self.assertEqual([s['id'] for s in stores], ['R648', 'R1'])
+        self.assertFalse(stores[0]['disabled'])
+        self.assertTrue(stores[1]['disabled'])
+        self.assertEqual(stores[0]['availability'][0]['quote'], '今天可取货')
+
+    def test_store_search_requires_district_for_messages_api(self):
+        with patch.object(options, 'store_search_messages') as messages,                 patch.object(options, 'store_search_requests', return_value=[]) as requests_:
+            options.store_search(Path('a.json'), '山东', '济南', '', '济南', 'MK2U4CH/A')
+        messages.assert_not_called()
+        requests_.assert_called_once()
+
+    def test_store_search_falls_back_to_bag_locator_when_messages_api_fails(self):
+        """fulfillment-messages 常被官网以 541 拒掉，必须退回下单时用的购物袋门店定位器。"""
+        fallback = [{'id': 'R648', 'name': '济南恒隆广场'}]
+        with patch.object(options, 'store_search_messages',
+                          side_effect=ValueError('官网门店接口返回 HTTP 541')),                 patch.object(options, 'store_search_requests', return_value=fallback) as requests_:
+            stores = options.store_search(Path('a.json'), '山东', '济南', '历下区', '', 'MK2U4CH/A')
+        self.assertEqual(stores, fallback)
+        requests_.assert_called_once()
+
+    def test_store_search_falls_back_when_messages_api_returns_empty(self):
+        fallback = [{'id': 'R648', 'name': '济南恒隆广场'}]
+        with patch.object(options, 'store_search_messages', return_value=[]),                 patch.object(options, 'store_search_requests', return_value=fallback):
+            stores = options.store_search(Path('a.json'), '山东', '济南', '历下区', '', 'MK2U4CH/A')
+        self.assertEqual(stores, fallback)
+
+    def test_store_search_reports_both_paths_when_both_fail(self):
+        with patch.object(options, 'store_search_messages', side_effect=ValueError('HTTP 541')),                 patch.object(options, 'store_search_requests',
+                              side_effect=ValueError('购物袋为空，请先加入一件商品后再查询门店。')):
+            with self.assertRaisesRegex(ValueError, '541') as caught:
+                options.store_search(Path('a.json'), '山东', '济南', '历下区', '', 'MK2U4CH/A')
+        self.assertIn('购物袋为空', str(caught.exception))
+
+    def test_account_region_options_requires_parent_levels(self):
+        with self.assertRaisesRegex(ValueError, '省'):
+            options.account_region_options(Path('a.json'), 'city')
+        with self.assertRaisesRegex(ValueError, '城市'):
+            options.account_region_options(Path('a.json'), 'district', '四川')
+        with self.assertRaisesRegex(ValueError, '层级'):
+            options.account_region_options(Path('a.json'), 'country')
+
+    def test_region_lookup_reports_reason_instead_of_silent_empty(self):
+        import requests
+        with patch.object(requests.Session, 'get') as get:
+            get.return_value.is_redirect = False
+            get.return_value.json.return_value = {'head': {'status': '200'}, 'body': {'content': {
+                'defaultLocation': True, 'address': {}}}}
+            region, note = options.current_region_detail(self.path.parent / 'auth.json')
+            self.assertEqual(region, {})
+            self.assertIn('没有保存', note)
         with patch.object(requests.Session, 'get', side_effect=requests.Timeout):
-            self.assertEqual(options.current_region(self.path.parent / 'auth.json'), {})
+            region, note = options.current_region_detail(self.path.parent / 'auth.json')
+            self.assertEqual(region, {})
+            self.assertIn('网络', note)
+        with patch.object(requests.Session, 'get') as get:
+            get.return_value.is_redirect = True
+            region, note = options.current_region_detail(self.path.parent / 'auth.json')
+            self.assertEqual(region, {})
+            self.assertIn('登录', note)
 
 
 if __name__ == '__main__':

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Check, LoaderCircle, Plus, Trash2, X } from "lucide-react";
+import { Alert, Button, Checkbox, List, Space, Spin, Typography } from "antd";
+import { CheckCircle2, LoaderCircle, Plus, Trash2, X } from "lucide-react";
 import { useAccountPrivacy } from "./AccountPrivacy";
 import type { Bridge } from "./api";
 import {
@@ -64,19 +65,21 @@ export function AccountGate({
     );
   }, [snapshot.accounts]);
 
-  const removeButton = (account: Account) => (
-    <button
-      className="text-button remove-account-button"
-      aria-label={format(`移除 ${account.name}（${account.email}）`)}
+  const removeButton = (item: Account) => (
+    <Button
+      type="text"
+      size="small"
+      danger
+      icon={<Trash2 />}
+      aria-label={format(`移除 ${item.name}（${item.email}）`)}
       disabled={
         running ||
-        snapshot.tasks.some((t) => t.account_id === account.id && active(t))
+        snapshot.tasks.some((t) => t.account_id === item.id && active(t))
       }
-      onClick={() => onRemove(account)}
+      onClick={() => onRemove(item)}
     >
-      <Trash2 size={15} />
       移除
-    </button>
+    </Button>
   );
 
   useEffect(() => {
@@ -111,7 +114,6 @@ export function AccountGate({
     return new Promise((resolve, reject) => {
       waiter.current = { id: taskId, resolve };
       setCurrentId(taskId);
-      // Covers completion before start() returned and a temporarily missed event.
       refresh().catch((e) => {
         if (waiter.current?.id === taskId) {
           waiter.current = null;
@@ -201,36 +203,34 @@ export function AccountGate({
 
   return (
     <main className="account-setup">
-      <h1>
+      <Typography.Title level={3}>
         {onBack || (!saved.length && !hadAccounts) || adding
           ? "添加并登录账号"
           : "选择本次使用的账号"}
-      </h1>
-      <p className="muted">
+      </Typography.Title>
+      <Typography.Paragraph type="secondary">
         {onBack || !saved.length
           ? "完成密码、二次验证和商城登录后，账号才会添加成功。"
           : "勾选后依次查询登录信息，需要重新认证时会提示你完成登录。"}
-      </p>
+      </Typography.Paragraph>
       {!onBack && saved.length > 0 && (
         <>
           <div className="account-selection" aria-label="本次使用的账号">
             {saved.map((a) => (
               <div className="account-option-row" key={a.id}>
-                <label className="account-option">
-                  <input
-                    type="checkbox"
-                    disabled={running}
-                    checked={selected.includes(a.id)}
-                    aria-label={format(`使用 ${a.name}（${a.email}）`)}
-                    onChange={(e) =>
-                      setSelected((s) =>
-                        e.target.checked
-                          ? [...s, a.id]
-                          : s.filter((id) => id !== a.id),
-                      )
-                    }
-                  />
-                  <span>
+                <Checkbox
+                  disabled={running}
+                  checked={selected.includes(a.id)}
+                  aria-label={format(`使用 ${a.name}（${a.email}）`)}
+                  onChange={(e) =>
+                    setSelected((s) =>
+                      e.target.checked
+                        ? [...s, a.id]
+                        : s.filter((id) => id !== a.id),
+                    )
+                  }
+                >
+                  <span className="account-option-copy">
                     <strong>{format(a.name)}</strong>
                     <small>{format(a.email)}</small>
                     {outcomes[a.id] && (
@@ -244,31 +244,35 @@ export function AccountGate({
                       </small>
                     )}
                   </span>
-                  {running && currentAccount === a.id ? (
-                    <LoaderCircle size={16} className="spin" />
-                  ) : outcomes[a.id]?.ok ? (
-                    <Check size={16} />
-                  ) : null}
-                </label>
-                {removeButton(a)}
+                </Checkbox>
+                <Space>
+                  {running && currentAccount === a.id && (
+                    <Spin
+                      indicator={<LoaderCircle className="spin" />}
+                      size="small"
+                    />
+                  )}
+                  {outcomes[a.id]?.ok && <CheckCircle2 />}
+                  {removeButton(a)}
+                </Space>
               </div>
             ))}
           </div>
           {!running && (
-            <div className="button-row">
-              <button
-                className="primary"
+            <Space wrap>
+              <Button
+                type="primary"
                 disabled={!selected.length}
                 onClick={checkSelected}
               >
                 检查并使用所选账号
-              </button>
+              </Button>
               {usable.length > 0 && (
-                <button onClick={() => onDone(usable)}>
+                <Button onClick={() => onDone(usable)}>
                   使用已通过的 {usable.length} 个账号
-                </button>
+                </Button>
               )}
-            </div>
+            </Space>
           )}
         </>
       )}
@@ -279,46 +283,61 @@ export function AccountGate({
           id={task ? `task-${task.id}` : undefined}
           tabIndex={-1}
         >
-          <h2>{format(account?.name || "正在处理账号")}</h2>
-          <p>{format(account?.email || "")}</p>
+          <Typography.Title level={5}>
+            {format(account?.name || "正在处理账号")}
+          </Typography.Title>
+          <Typography.Paragraph type="secondary">
+            {format(account?.email || "")}
+          </Typography.Paragraph>
           {task?.prompt ? (
             renderPrompt(task, stop)
           ) : (
-            <p className="loading-line">
-              <LoaderCircle size={16} className="spin" />
+            <Typography.Paragraph>
+              <Spin
+                indicator={<LoaderCircle className="spin" />}
+                size="small"
+              />{" "}
               {format(task?.stage || "正在启动登录检查")}
-            </p>
+            </Typography.Paragraph>
           )}
           {!task?.prompt && (
-            <button onClick={stop} className="operation-cancel">
-              <X size={14} />
+            <Button className="operation-cancel" icon={<X />} onClick={stop}>
               取消
-            </button>
+            </Button>
           )}
         </section>
       )}
       {error && (
-        <p role="alert" className="error-text">
-          {format(error)}
-        </p>
+        <Alert
+          type="error"
+          showIcon
+          title={format(error)}
+          style={{ marginBottom: 12 }}
+        />
       )}
       {!running && (
         <>
           {pending.length > 0 && (
             <section className="pending-accounts">
-              <h2>未完成添加</h2>
-              {pending.map((a) => (
-                <div className="pending-account" key={a.id}>
-                  <span>
-                    {format(a.name)}
-                    <small>{format(a.email)}</small>
-                  </span>
-                  <button onClick={() => enroll(a.id)}>
-                    继续登录 {format(a.name)}
-                  </button>
-                  {removeButton(a)}
-                </div>
-              ))}
+              <Typography.Title level={5}>未完成添加</Typography.Title>
+              <List
+                dataSource={pending}
+                renderItem={(a) => (
+                  <List.Item
+                    actions={[
+                      <Button key="resume" onClick={() => enroll(a.id)}>
+                        继续登录 {format(a.name)}
+                      </Button>,
+                      removeButton(a),
+                    ]}
+                  >
+                    <List.Item.Meta
+                      title={format(a.name)}
+                      description={format(a.email)}
+                    />
+                  </List.Item>
+                )}
+              />
             </section>
           )}
           {adding || (!snapshot.accounts.length && !hadAccounts) ? (
@@ -329,15 +348,14 @@ export function AccountGate({
                 : undefined,
             )
           ) : (
-            <button className="text-button" onClick={() => setAdding(true)}>
-              <Plus size={15} />
+            <Button type="link" icon={<Plus />} onClick={() => setAdding(true)}>
               添加新账号
-            </button>
+            </Button>
           )}
           {onBack && (
-            <button className="text-button" onClick={onBack}>
+            <Button type="link" onClick={onBack}>
               返回工作台
-            </button>
+            </Button>
           )}
         </>
       )}

@@ -44,7 +44,10 @@ class PublicPagesTests(unittest.TestCase):
         address = {'contact': {'lastName': '测', 'firstName': '试', 'emailAddress': 'test@example.test', 'fullDaytimePhone': '13800000000'},
                    'delivery': {'state': '四川', 'city': '成都', 'district': '锦江区'}, 'address': {'street': '测试路 1 号'}}
         self.service.run('address_save', address)
-        self.assertEqual(self.service.run('address_read', {})['config'], address)
-        self.assertEqual(json.loads(self.service.checkout.read_text()), address)
+        # 下单始终全自动：保存地址时会写入 auto_checkout=True。
+        self.assertEqual(self.service.run('address_read', {})['config'],
+                         {**address, 'auto_checkout': True})
+        self.assertEqual(json.loads(self.service.checkout.read_text()),
+                         {**address, 'auto_checkout': True})
         self.assertFalse(self.service.auth.exists())
         self.vault.get.assert_not_called()

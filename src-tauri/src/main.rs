@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod engine;
-use engine::{Account, Engine, Snapshot, TaskHost};
-use serde_json::Value;
+use engine::{Account, Engine, PresetItem, Snapshot, TaskHost};
+use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -28,10 +28,9 @@ async fn remove_account(
 fn save_preset(
     state: State<'_, Arc<Engine>>,
     account_id: String,
-    sku: String,
-    quantity: u32,
+    items: Vec<PresetItem>,
 ) -> Result<Account, String> {
-    state.save_preset(&account_id, sku, quantity)
+    state.save_preset(&account_id, items)
 }
 #[tauri::command]
 async fn start_task(
@@ -39,11 +38,14 @@ async fn start_task(
     state: State<'_, Arc<Engine>>,
     account_id: String,
     action: String,
-    params: Value,
+    params: Option<Value>,
 ) -> Result<String, String> {
-    state
-        .inner()
-        .start(host.inner().clone(), account_id, action, params)
+    state.inner().start(
+        host.inner().clone(),
+        account_id,
+        action,
+        params.unwrap_or_else(|| json!({})),
+    )
 }
 #[tauri::command]
 fn reply_task(
@@ -56,6 +58,32 @@ fn reply_task(
 ) -> Result<(), String> {
     state.reply(host.inner(), &account_id, &task_id, &request_id, value)
 }
+// 桌面版的 webview 不接管 target=_blank：用系统默认浏览器打开官网页面。
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    let url = url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) || url.len() > 2048 {
+        return Err("只允许打开 http(s) 链接".into());
+    }
+    #[cfg(target_os = "windows")]
+    let program = "cmd";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let program = "xdg-open";
+    let mut command = std::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    command.args(["/C", "start", "", url]);
+    #[cfg(not(target_os = "windows"))]
+    command.arg(url);
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("无法打开浏览器：{e}"))
+}
+
 #[tauri::command]
 fn cancel_task(
     state: State<'_, Arc<Engine>>,
@@ -118,6 +146,7 @@ fn main() {
             add_account,
             remove_account,
             save_preset,
+            open_url,
             start_task,
             reply_task,
             cancel_task

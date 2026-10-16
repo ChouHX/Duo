@@ -103,30 +103,48 @@ test("dev command serves real source tasks, hot updates, and releases its worksp
     path: "artifacts/dev-login-sidebar.png",
     fullPage: true,
   });
-  await page.getByRole("link", { name: "本地配置", exact: true }).click();
-  await expect(page).toHaveURL(/#\/settings$/);
+  await page
+    .locator(".sidebar")
+    .getByRole("button", { name: /通用预设/ })
+    .click();
+  await expect(page).toHaveURL(/#\/account$/);
+  // 通用预设只有送货方式一项，不再渲染页签组件。
+  await expect(page.getByRole("tab")).toHaveCount(0);
   await expect(
     page.getByRole("heading", { name: "快捷送货地址" }),
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "保存地址预设" }),
   ).toBeEnabled();
+  // 购买预设是全局的，放在账号工作台。
+  await page.getByRole("link", { name: "账号工作台", exact: true }).click();
+  await page.getByRole("tab", { name: "购买预设", exact: true }).click();
   await page.getByRole("combobox", { name: "预制商品" }).click();
   await page.getByRole("option", { name: /MK2W4CH/ }).click();
   await page.getByLabel("数量", { exact: true }).fill("3");
   await page.getByRole("button", { name: "保存购买预设", exact: true }).click();
   await expect(page.getByText("购买预设已保存", { exact: true })).toBeVisible();
+  await page
+    .locator(".sidebar")
+    .getByRole("button", { name: /通用预设/ })
+    .click();
   for (const [label, value] of Object.entries({
     姓氏: "张",
     名字: "测试",
     通知邮箱: "shipping@example.test",
     手机号: "13800000000",
-    "省 / 直辖市": "四川",
-    城市: "成都",
-    "区 / 县": "锦江区",
     详细地址: "测试路 8 号",
   })) {
     await page.getByLabel(label, { exact: true }).fill(value);
+  }
+  // 省 / 市 / 区是官网真实数据的级联下拉（address-lookup，无需登录会话）。
+  for (const [label, value] of [
+    ["省 / 直辖市", "四川"],
+    ["城市", "成都"],
+    ["区 / 县", "锦江区"],
+  ] as const) {
+    await page.getByRole("combobox", { name: label, exact: true }).click();
+    await page.getByRole("option", { name: value, exact: true }).click();
   }
   await page.getByRole("button", { name: "保存地址预设" }).click();
   await expect(
@@ -137,8 +155,16 @@ test("dev command serves real source tasks, hot updates, and releases its worksp
     fullPage: true,
   });
   await page.reload();
-  await expect(page.getByLabel("详细地址")).toHaveValue("测试路 8 号");
-  await expect(page.getByLabel("商品 SKU")).toHaveValue("MK2W4CH");
+  // 刷新后通用预设要重新读取本机配置，worker 冷启动需要一点时间。
+  await expect(page.getByLabel("详细地址")).toHaveValue("测试路 8 号", {
+    timeout: 20000,
+  });
+  await page.getByRole("link", { name: "账号工作台", exact: true }).click();
+  await page.getByRole("tab", { name: "批量下单", exact: true }).click();
+  // 批量下单表单以全局购买预设为默认值。
+  await expect(page.getByLabel("商品 SKU")).toHaveValue("MK2W4CH", {
+    timeout: 20000,
+  });
   await page.getByRole("link", { name: "DUO 状态", exact: true }).click();
   await expect(page).toHaveURL(/#\/duo$/);
   const sidebar = await page.locator(".sidebar").boundingBox();
@@ -167,23 +193,18 @@ test("dev command serves real source tasks, hot updates, and releases its worksp
   await page.getByRole("button", { name: "取消", exact: true }).click();
   await expect(page.getByRole("heading", { name: "未完成添加" })).toBeVisible();
   // The pending account inherited the saved defaults, without logging into Apple.
-  await page.getByRole("link", { name: "本地配置", exact: true }).click();
-  await page.getByRole("combobox", { name: "配置范围" }).click();
-  await expect(page.getByRole("listbox")).toBeVisible();
-  await expect(
-    page.getByRole("option", {
-      name: "d**@example.test · d**@example.test（待完成登录）",
-      exact: true,
-    }),
-  ).toBeVisible();
-  await page
-    .getByRole("option", {
-      name: "d**@example.test · d**@example.test（待完成登录）",
-      exact: true,
-    })
-    .click();
-  await expect(page.getByLabel("详细地址")).toHaveValue("测试路 8 号");
-  await expect(page.getByLabel("商品 SKU")).toHaveValue("MK2W4CH");
+  await page.locator(".sidebar .account.pending").click();
+  await expect(page).toHaveURL(/#\/account$/);
+  await page.getByRole("tab", { name: "送货方式" }).click();
+  await expect(page.getByLabel("详细地址")).toHaveValue("测试路 8 号", {
+    timeout: 20000,
+  });
+  await expect(page.getByRole("tab")).toHaveText([
+    "账号与登录",
+    "送货方式",
+    "购物袋",
+    "订单",
+  ]);
   await page.getByRole("link", { name: "账号工作台", exact: true }).click();
   const source = (value: string) =>
     `window.__devProbe = ${JSON.stringify(value)}; if (import.meta.hot) import.meta.hot.accept();\n`;

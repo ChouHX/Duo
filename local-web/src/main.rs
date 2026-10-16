@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use engine::{Engine, Task, TaskHost};
+use engine::{Engine, PresetItem, Task, TaskHost};
 use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -32,6 +32,12 @@ struct LocalState {
 }
 
 // Match the existing desktop bridge so all account and checkout UI can be reused.
+// Missing or null ``params`` must behave like ``{}`` (e.g. address_read / region
+// take no options); the engine rejects a non-object params value.
+fn empty_params() -> Value {
+    json!({})
+}
+
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Input {
@@ -41,7 +47,7 @@ struct Input {
     account_id: String,
     #[serde(default)]
     action: String,
-    #[serde(default)]
+    #[serde(default = "empty_params")]
     params: Value,
     #[serde(default)]
     task_id: String,
@@ -50,9 +56,7 @@ struct Input {
     #[serde(default)]
     value: Value,
     #[serde(default)]
-    sku: String,
-    #[serde(default)]
-    quantity: u32,
+    items: Vec<PresetItem>,
 }
 
 async fn command(
@@ -66,7 +70,7 @@ async fn command(
         "remove_account" => s.engine.remove_account(&s.host, &p.account_id).await.map(|_| Value::Null),
         "save_preset" => s
             .engine
-            .save_preset(&p.account_id, p.sku, p.quantity)
+            .save_preset(&p.account_id, p.items)
             .map(|a| json!(a)),
         "start_task" => s
             .engine
@@ -152,7 +156,7 @@ async fn guard(State(s): State<LocalState>, request: Request, next: Next) -> Res
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://timeapi.io; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'"));
     response
 }
 

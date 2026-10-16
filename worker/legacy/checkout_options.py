@@ -1,9 +1,11 @@
 """根据结账页面实时模型选择配送、自提与收货地址。"""
+import hashlib
 import json
 import os
 import re
 import sys
 import tempfile
+from urllib.parse import urlencode, urlsplit
 
 import requests
 import interaction
@@ -17,11 +19,76 @@ def value(node, path, default=None):
     return node
 
 
-def read_config(path):
+def read_config(path, defaults=True):
+    """读取结账配置。
+
+    账号自己的 checkout.json 里没填的字段，回退到通用预设
+    （同一数据目录下的 settings/checkout.json），这样“通用预设”对已有账号同样生效，
+    而不是只在添加账号时复制一次。
+    """
     config = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
     if not isinstance(config, dict):
         raise ValueError('checkout.json 必须是 JSON 对象。')
-    return config
+    if not defaults:
+        return config
+    base = default_config_path(path)
+    if base is None:
+        return config
+    inherited = read_config(base, defaults=False)
+    return merge_defaults(inherited, config) if inherited else config
+
+
+def default_config_path(path):
+    """账号配置的兜底来源：<数据目录>/settings/checkout.json（通用预设）。
+
+    仅对 <数据目录>/accounts/<账号ID>/checkout.json 这种布局生效；通用预设自身不再回退。
+    """
+    if path.parent.name == 'settings' or path.parent.parent.name != 'accounts':
+        return None
+    candidate = path.parent.parent.parent / 'settings' / 'checkout.json'
+    return candidate if candidate.is_file() else None
+
+
+def merge_defaults(defaults, config):
+    """账号自己填过的字段优先，其余从通用预设继承；嵌套字段逐项合并。"""
+    merged = dict(defaults)
+    for key, val in config.items():
+        if isinstance(val, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **val}
+        else:
+            merged[key] = val
+    return merged
+
+
+def auto_checkout(config):
+    """全自动下单：缺省启用，只有明确写入 False 才关闭。"""
+    return config.get('auto_checkout') is not False
+
+
+def apply_preset(path):
+    """把“通用预设”整份复制到账号自己的 checkout.json（账号已填的同名字段会被覆盖）。"""
+    general = default_config_path(path)
+    if general is None:
+        raise ValueError('通用预设不可用。')
+    source = read_config(general, defaults=False)
+    if not source:
+        raise ValueError('通用预设还是空的，请先在“通用预设”里填写地址或送货方式。')
+    target = read_config(path, defaults=False)
+    for key, value in source.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            target[key] = {**target[key], **value}
+        else:
+            target[key] = value
+    # 下单始终全自动，这里保持一致。
+    target['auto_checkout'] = True
+    save_config(path, target)
+    return target
+
+
+def preset_complete(config):
+    """本地快捷地址是否足够用于“使用本地快捷地址”结账。"""
+    return bool(str(value(config, 'address.street') or '').strip()
+                and isinstance(config.get('delivery'), dict) and config['delivery'])
 
 
 def save_config(path, config):
@@ -102,25 +169,356 @@ def contact(config):
     return result
 
 
+LOCATION_URL = 'https://www.apple.com.cn/shop/address/location/update'
+REGION_KEYS = ('state', 'city', 'district')
+
+
+def region_from_address(address):
+    """从官网地区响应中提取省 / 市 / 区，缺项不臆造。"""
+    if not isinstance(address, dict):
+        return {}
+    return {key: address[key].strip() for key in REGION_KEYS
+            if isinstance(address.get(key), str) and address[key].strip()}
+
+
+def current_region_detail(auth_path):
+    """读取官网会话地区，返回 (地区, 说明)。
+
+    地区为空时用说明区分原因（未登录 / 网络失败 / 会话没有保存地区），
+    让界面能提示用户，而不是静默成功。不提交定位同意，不修改登录配置。
+    """
+    from duo_killer import load_auth, log
+    from apple_login import is_transient_status
+    session = requests.Session()
+    try:
+        if auth_path.exists():
+            load_auth(session, json.loads(auth_path.read_text(encoding='utf-8')))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        log.warning('读取官网地区失败：本地会话不可用（%s）。', type(error).__name__)
+        return {}, '本地会话文件不可用，请先完成该账号登录或重新导入会话。'
+    try:
+        response = session.get(
+            LOCATION_URL, timeout=(3, 8), allow_redirects=False,
+            headers={'Accept': 'application/json', 'Referer': 'https://www.apple.com.cn/',
+                     'X-Requested-With': 'XMLHttpRequest'})
+        if response.is_redirect:
+            log.info('读取官网地区：官网要求登录（HTTP %s）。', response.status_code)
+            return {}, '官网会话已失效，请先完成该账号登录后再读取地区。'
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as error:
+        log.warning('读取官网地区失败：%s。', type(error).__name__)
+        status = getattr(getattr(error, 'response', None), 'status_code', None)
+        if status is not None and is_transient_status(status):
+            # 官网 5xx / 429 与用户的网络、代理无关，别让用户白折腾代理设置。
+            return {}, f'Apple 官网暂时不可用（HTTP {status}），请稍后重试。'
+        return {}, '网络请求失败，请检查网络或系统代理。'
+    except (ValueError, KeyError, TypeError) as error:
+        log.warning('读取官网地区失败：官网响应无法解析（%s）。', type(error).__name__)
+        return {}, '官网未返回可解析的地区数据，请稍后重试。'
+    finally:
+        session.close()
+    if str(value(data, 'head.status')) != '200':
+        log.warning('读取官网地区失败：官网业务状态 %s。', value(data, 'head.status'))
+        return {}, '官网未确认地区请求，请稍后重试。'
+    content = value(data, 'body.content', {})
+    region = region_from_address(content.get('address'))
+    if not region:
+        log.info('读取官网地区：会话没有保存的收货地区。')
+        return {}, '官网会话没有保存的收货地区，请手动填写省市区后再保存。'
+    # 官网返回的默认地区（按网络定位）也照常采用，用户可修改后再保存。
+    note = '（官网默认地区）' if content.get('userEnteredLocation') is not True else ''
+    return region, '已读取官网地区%s：%s。' % (note, ' '.join(region.values()))
+
+
 def current_region(auth_path):
     """读取官网会话地区，不提交定位同意，不修改登录配置。"""
-    from duo_killer import load_auth
+    return current_region_detail(auth_path)[0]
+
+
+# ------------------------------------------------------------------ 账号地址 --
+# 官网没有单独的「省市县」字典接口：必须打开账号首页的「编辑地址」，
+# 那里才下发 stateOptions / cityOptions / districtOptions 以及联动动作。
+ACCOUNT_HOME = 'https://secure.www.apple.com.cn/shop/account/home'
+EDIT_SELECTOR = ('home.customerAccount.shippingInfo.shippingAddress'
+                 '.editShippingAddress.editAddress.stateCitySelectorForCheckout')
+REGION_OPTIONS = {'state': 'stateOptions', 'city': 'cityOptions', 'district': 'districtOptions'}
+# 账号首页把省份存成 ISO 3166-2:CN 代码，编辑页用的是中文名。
+PROVINCE_NAMES = {
+    'BJ': '北京', 'TJ': '天津', 'HE': '河北', 'SX': '山西', 'NM': '内蒙古',
+    'LN': '辽宁', 'JL': '吉林', 'HL': '黑龙江', 'SH': '上海', 'JS': '江苏',
+    'ZJ': '浙江', 'AH': '安徽', 'FJ': '福建', 'JX': '江西', 'SD': '山东',
+    'HA': '河南', 'HB': '湖北', 'HN': '湖南', 'GD': '广东', 'GX': '广西壮族自治区',
+    'HI': '海南', 'CQ': '重庆', 'SC': '四川', 'GZ': '贵州', 'YN': '云南',
+    'XZ': '西藏自治区', 'SN': '陕西', 'GS': '甘肃', 'QH': '青海', 'NX': '宁夏回族自治区',
+    'XJ': '新疆维吾尔自治区',
+}
+
+
+def _account_flow(auth_path):
+    """建立已登录会话并打开账号首页的编辑地址选择器。
+
+    官网会话被挑战时，复用「检查登录」的重新认证链路自动恢复，
+    然后再读账户页。返回 (session, flow)；调用方负责 session.close()。
+    """
+    from duo_killer import Checkout, load_auth, account_info, save_auth, log
+    session = requests.Session()
     try:
-        with requests.Session() as session:
-            if auth_path.exists():
-                load_auth(session, json.loads(auth_path.read_text(encoding='utf-8')))
-            response = session.get('https://www.apple.com.cn/shop/address/location/update',
-                                   timeout=(3, 5), allow_redirects=False)
-            response.raise_for_status()
-            data = response.json()
-            content = value(data, 'body.content', {})
-            if str(value(data, 'head.status')) != '200' or content.get('defaultLocation') is True:
-                return {}
-            address = content.get('address', {})
-            return {key: address[key].strip() for key in ('state', 'city', 'district')
-                    if isinstance(address.get(key), str) and address[key].strip()}
-    except (requests.RequestException, OSError, ValueError, KeyError, TypeError, AttributeError):
-        return {}
+        load_auth(session, json.loads(auth_path.read_text(encoding='utf-8')))
+        flow = Checkout(session)
+        flow.page(ACCOUNT_HOME, '读取账户')
+        if 'signIn' in flow.model or urlsplit(flow.url).path.startswith('/shop/signIn'):
+            log.info('读取官网地区：官网要求重新认证，改用保存的凭据登录。')
+            account_info(session)
+            save_auth(session)
+            flow = Checkout(session)
+            flow.page(ACCOUNT_HOME, '读取账户')
+            if 'signIn' in flow.model or urlsplit(flow.url).path.startswith('/shop/signIn'):
+                raise ValueError('官网会话已失效，请先完成该账号登录后再读取官网地区。')
+        flow.action('home.customerAccount.shippingInfo.shippingAddress', 'editAddress')
+        flow.require(EDIT_SELECTOR)
+        return session, flow
+    except Exception:
+        session.close()
+        raise
+
+
+def _region_payload(flow, path, **wanted):
+    node = value(flow.model, path + '.d', {})
+    payload = {path + '.' + key: node.get(key, '') for key in
+               ('state', 'city', 'district', 'provinceCityDistrict')}
+    payload.update({path + '.' + key: val for key, val in wanted.items()})
+    payload[path + '.countryCode'] = 'CN'
+    return payload
+
+
+def account_region(auth_path):
+    """读取账号首页的默认收货地址，并返回省市区选项。
+
+    返回 {'region': {...}, 'contact': {...}, 'address': {...}, 'states': [...],
+        'saved': 是否真的取到默认地址}。
+    """
+    session, flow = _account_flow(auth_path)
+    try:
+        shipping = value(flow.model,
+                         'home.customerAccount.shippingInfo.shippingAddress.d', {})
+        shipping = shipping if isinstance(shipping, dict) else {}
+        states = value(flow.model, EDIT_SELECTOR + '.d.stateOptions', []) or []
+    finally:
+        session.close()
+    values = {option.get('value') for option in states if isinstance(option, dict)}
+    state = shipping.get('state')
+    state = PROVINCE_NAMES.get(str(state).upper(), '') if isinstance(state, str) else ''
+    if not state and shipping.get('state') in values:
+        state = shipping['state']
+    city = shipping.get('city')
+    city = city.rstrip(', ').strip() if isinstance(city, str) else ''
+    region = {key: val for key, val in (('state', state), ('city', city)) if val}
+    contact = {key: shipping[key] for key in ('lastName', 'firstName', 'fullDaytimePhone')
+               if isinstance(shipping.get(key), str) and shipping[key].strip()}
+    address = {key: shipping[key] for key in ('street', 'street2')
+               if isinstance(shipping.get(key), str) and shipping[key].strip()}
+    return {'region': region, 'contact': contact, 'address': address,
+            'states': states, 'saved': bool(region or contact or address)}
+
+
+REGION_LOOKUP = 'https://www.apple.com.cn/shop/address-lookup'
+
+
+def lookup_regions(state='', city=''):
+    """官网地区级联：无参取省，带 state 取市，带 state+city 取区。
+
+    这个接口不需要登录会话，通用预设也能用。
+    """
+    params = {}
+    if state:
+        params['state'] = state
+    if city:
+        params['city'] = city
+    level = 'district' if (state and city) else ('city' if state else 'state')
+    response = requests.get(REGION_LOOKUP, params=params,
+                            headers={'accept': '*/*', 'accept-language': 'zh-CN,zh;q=0.9'},
+                            timeout=20)
+    if response.status_code != 200:
+        raise ValueError(f'读取官网地区失败：HTTP {response.status_code}。')
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError('读取官网地区失败：返回了非 JSON 内容。') from None
+    rows = value(data, 'body.' + level + '.data', []) or []
+    return [{'value': str(row['value']), 'label': str(row.get('label') or row['value'])}
+            for row in rows if isinstance(row, dict) and row.get('value')]
+
+
+def account_region_options(auth_path, level, state=None, city=None):
+    """按层级返回省 / 市 / 区选项；city 需要 state，district 需要 state 和 city。"""
+    if level not in REGION_OPTIONS:
+        raise ValueError('不支持的地区层级。')
+    if level in ('city', 'district') and not state:
+        raise ValueError('请先选择省 / 直辖市。')
+    if level == 'district' and not city:
+        raise ValueError('请先选择城市。')
+    try:
+        return lookup_regions(state or '', city if level == 'district' else '')
+    except (ValueError, requests.RequestException):
+        pass  # 官网接口不可用时回退到账号页面的地区选择器。
+    session, flow = _account_flow(auth_path)
+    try:
+        if level in ('city', 'district'):
+            flow.action(EDIT_SELECTOR, 'Selectstate',
+                        _region_payload(flow, EDIT_SELECTOR, state=state))
+        if level == 'district':
+            flow.action(EDIT_SELECTOR, 'Selectcity',
+                        _region_payload(flow, EDIT_SELECTOR, state=state, city=city))
+        return value(flow.model, EDIT_SELECTOR + '.d.' + REGION_OPTIONS[level], []) or []
+    finally:
+        session.close()
+
+
+# -------------------------------------------------------------- 零售店查询 --
+def _store_summary(store):
+    lines = value(store, 'availability.lineItemAvailability', []) or []
+    availability = [{'name': line.get('partName'), 'quote': line.get('availabilityQuote')}
+                    for line in lines if isinstance(line, dict)]
+    return {
+        'id': store.get('storeId'), 'name': store.get('storeName'),
+        'disabled': store.get('storeDisabled') is True,
+        'city': store.get('city') or store.get('storeCity') or '',
+        'address': store.get('address') or store.get('storeAddress') or '',
+        'distance': store.get('distance'),
+        'availability': availability,
+    }
+
+
+def store_search_requests(auth_path, state='', city='', district='', search=''):
+    """在购物袋页的「门店定位器」里按省/市/区查询可自提的零售店。
+
+    需要购物袋里至少有一件商品（官网门店定位器挂在商品上）。返回门店摘要列表。
+    """
+    from duo_killer import Checkout, BASE_URL, load_auth, account_info, save_auth, log
+    session = requests.Session()
+    try:
+        load_auth(session, json.loads(auth_path.read_text(encoding='utf-8')))
+        flow = Checkout(session)
+        flow.page(BASE_URL + '/shop/bag', '读取购物袋')
+        if 'signIn' in flow.model or urlsplit(flow.url).path.startswith('/shop/signIn'):
+            log.info('查询门店：官网要求重新认证，改用保存的凭据登录。')
+            account_info(session)
+            save_auth(session)
+            flow = Checkout(session)
+            flow.page(BASE_URL + '/shop/bag', '读取购物袋')
+        items = [key for key in value(flow.model, 'shoppingCart.items', {}) if key.startswith('item-')]
+        if not items:
+            raise ValueError('购物袋为空，请先加入一件商品后再查询门店。')
+        base = 'shoppingCart.items.' + items[0] + '.delivery'
+        # 先取反爬令牌 as_atb，否则 /shop/bagx 的 POST 会被官网以 541 拒绝。
+        from duo_killer import request_get
+        request_get(session, '门店反爬令牌', BASE_URL + '/shop/beacon/atb')
+        flow.action(base, 'storeLocatorView')
+        locator = base + '.storeLocator'
+        tabs = locator + '.address.provinceCityDistrictTabs'
+        if state:
+            flow.action(tabs, 'Selectstate', _region_payload(flow, tabs, state=state))
+        if city:
+            flow.action(tabs, 'Selectcity',
+                        _region_payload(flow, tabs, state=state, city=city))
+        payload = {locator + '.showAllStores': 'false', locator + '.selectStore': '',
+                   locator + '.searchInput': search or district or city or state}
+        payload.update(_region_payload(flow, tabs, state=state, city=city, district=district))
+        flow.action(locator, 'search', payload)
+        stores = value(flow.model, locator + '.searchResults.d.retailStores', []) or []
+        return [_store_summary(store) for store in stores if isinstance(store, dict)]
+    finally:
+        session.close()
+
+
+def store_search_messages(auth_path, state, city, district, sku):
+    """按「省 → 市 → 区」查询可自提门店（官网 fulfillment-messages）。
+
+    官网这个接口只认真实浏览器：requests 即使带上有效 Cookie 也会被 541 拦截，
+    所以在专用 Chrome 配置里先取 as_atb 反爬令牌，再用页面自身的 fetch 请求。
+    不需要登录会话。
+    """
+    from apple_login import open_browser_page, BrowserContextError
+    location = ' '.join(part for part in (state, city, district) if part)
+    if not location:
+        raise ValueError('请先选择省 / 市 / 区。')
+    if not sku:
+        raise ValueError('请先在“购买预设”里选择商品 SKU，门店可用性按商品查询。')
+    query = urlencode({'fae': 'true', 'pl': 'true', 'mts.0': 'regular',
+                       'parts.0': sku, 'location': location})
+    url = 'https://www.apple.com.cn/shop/fulfillment-messages?' + query
+    try:
+        with open_browser_page(auth_path, url='https://www.apple.com.cn/shop/buy-iphone') as page:
+            result = page.evaluate(STORE_MESSAGES_JS, url)
+    except BrowserContextError as error:
+        raise ValueError(f'查询门店需要浏览器上下文：{error}') from None
+    status = (result or {}).get('status')
+    data = (result or {}).get('data')
+    if status != 200 or not isinstance(data, dict):
+        raise ValueError(f'官网门店接口返回 HTTP {status}，未能读取门店列表。')
+    stores = value(data, 'body.content.pickupMessage.stores', None)
+    if stores is None:
+        stores = value(data, 'body.content.fulfillmentMessages.regular.stores', []) or []
+    return [_store_message_summary(store, sku) for store in stores if isinstance(store, dict)]
+
+
+STORE_MESSAGES_JS = """async (url) => {
+  // 先取反爬令牌，否则 fulfillment-messages 会被官网以 541 拒绝。
+  try { await fetch('/shop/beacon/atb', { headers: { accept: '*/*' } }); } catch (e) {}
+  const response = await fetch(url, { headers: { accept: '*/*' } });
+  const text = await response.text();
+  try { return { status: response.status, data: JSON.parse(text) }; }
+  catch (e) { return { status: response.status, data: null }; }
+}"""
+
+
+def _store_message_summary(store, sku):
+    availability = value(store, 'partsAvailability.' + sku, {}) or {}
+    quote = (availability.get('pickupSearchQuote')
+             or value(availability, 'messageTypes.regular.storePickupQuote', '')
+             or availability.get('pickupDisplay', ''))
+    title = value(availability, 'messageTypes.regular.storePickupProductTitle', '') or sku
+    return {
+        'id': store.get('storeNumber') or store.get('storeId'),
+        'name': store.get('storeName'),
+        'disabled': availability.get('pickupDisplay') not in (None, 'available', 'inStock'),
+        'city': store.get('city') or store.get('storeCity') or '',
+        'state': store.get('state') or store.get('storeState') or '',
+        'address': _store_address(store.get('storeAddress') or store.get('address')),
+        'distance': store.get('storeDistance'),
+        'availability': [{'name': title, 'quote': quote}] if quote else [],
+    }
+
+
+def _store_address(raw):
+    if isinstance(raw, dict):
+        line = raw.get('address2') or raw.get('address') or ''
+        postal = raw.get('postalCode') or ''
+        return ' '.join(str(part) for part in (line, postal) if part)
+    return str(raw or '')
+
+
+def store_search(auth_path, state='', city='', district='', search='', sku=''):
+    """按省 / 市 / 区查询零售店。
+
+    主链路是官网 fulfillment-messages（不依赖购物袋）；该接口对脚本请求经常直接返回
+    541 或空列表，所以失败时退回购物袋页的门店定位器——下单选门店用的就是同一条链路。
+    """
+    if not (state and city and district):
+        return store_search_requests(auth_path, state, city, district, search)
+    try:
+        stores = store_search_messages(auth_path, state, city, district, sku)
+    except Exception as error:
+        primary_error = str(error)
+    else:
+        if stores:
+            return stores
+        primary_error = '官网门店接口（fulfillment-messages）返回了空列表。'
+    try:
+        return store_search_requests(auth_path, state, city, district, search)
+    except Exception as error:
+        raise ValueError(f'{primary_error} 备用链路（购物袋门店定位器）也失败：{error}') from None
 
 
 def configure_address(path, auth_path=None):
@@ -158,7 +556,7 @@ def configure_address(path, auth_path=None):
     return {'success': True, 'config_file': str(path)}
 
 
-def region_data(flow, path, wanted=None, *, prefer_current=False):
+def region_data(flow, path, wanted=None, *, prefer_current=False, interactive=True):
     wanted = wanted or {}
     if prefer_current:
         current = flow.require(path)['d']
@@ -180,9 +578,17 @@ def region_data(flow, path, wanted=None, *, prefer_current=False):
                                                           re.sub(suffix, '', str(title).strip()))))
         if len(matches) == 1 and matches[0] != desired:
             print(f'{label}自动匹配：{desired} → {matches[0]}')
-        elif len(matches) != 1 and desired:
+        elif len(matches) != 1 and desired and interactive:
             print(f'配置中的{label}“{desired}”无法唯一匹配官网选项，请确认。')
-        chosen = matches[0] if len(matches) == 1 else choose(label, options, data.get(key))
+        if len(matches) == 1:
+            chosen = matches[0]
+        elif interactive:
+            chosen = choose(label, options, data.get(key))
+        else:
+            # 全自动流程不能卡在提问上：匹配不上就沿用官网当前值。
+            if desired:
+                print(f'配置中的{label}“{desired}”未匹配官网选项，沿用官网当前值：{data.get(key)}')
+            chosen = data.get(key)
         selected[key] = chosen
         payload = {path + '.' + k: data.get(k, '') for k in ('state', 'city', 'district', 'provinceCityDistrict')}
         payload.update({path + '.' + k: v for k, v in selected.items()})
@@ -197,7 +603,7 @@ def region_data(flow, path, wanted=None, *, prefer_current=False):
             path + '.countryCode': 'CN', path + '.provinceCityDistrict': ' '.join(selected.values())}
 
 
-def shipping_options(flow, groups_path):
+def shipping_options(flow, groups_path, auto=False):
     payload = {}
     for group in flow.require(groups_path).get('c', []):
         options_path = groups_path + '.' + group + '.shipmentOptionsGroups'
@@ -207,9 +613,15 @@ def shipping_options(flow, groups_path):
             options = [(o['value'], o.get('label') or o.get('title') or
                         ' / '.join(str(o[k]) for k in ('deliveryQuote', 'deliveryTimeSlot', 'shippingCost') if o.get(k)) or o['value'])
                        for o in node.get('options', []) if o.get('value') and not o.get('disabled')]
-            selected = choose('配送服务', options, node.get('selectShippingOption')) if len(options) > 1 else options[0][0] if options else None
-            if selected is None:
+            if not options:
                 raise ValueError('当前商品没有可用配送服务。')
+            keys = [key for key, _ in options]
+            default = node.get('selectShippingOption')
+            if len(options) > 1 and not auto:
+                selected = choose('配送服务', options, default)
+            else:
+                # 全自动：用官网默认配送；没有默认就用第一个可用项。
+                selected = default if default in keys else keys[0]
             payload[path + '.selectShippingOption'] = selected
     return payload
 
@@ -262,7 +674,7 @@ def home_delivery(flow, config):
         raise ValueError('服务端未确认切换为送货，已停止。')
     tab = path + '.deliveryTab.delivery'
     payload.update(region_data(flow, tab + '.deliveryLocation.address.provinceCityDistrictTabsForCheckout', config.get('delivery'), prefer_current=True))
-    payload.update(shipping_options(flow, tab + '.shipmentGroups'))
+    payload.update(shipping_options(flow, tab + '.shipmentGroups', auto_checkout(config)))
     flow.action(path, 'continueFromFulfillmentToShipping', payload)
     flow.require('checkout.shipping')
 
@@ -273,21 +685,52 @@ def fulfillment(flow, config_path):
     node = flow.require(path + '.fulfillmentOptions')['d']
     options = [(o['value'], o.get('title', o['value'])) for o in node.get('options', [])
                if o.get('value') in ('HOME', 'RETAIL') and not o.get('disabled')]
-    mode = choose('收货方式', options, 'HOME')
+    values = [value for value, _ in options]
+    preset = config.get('store') if isinstance(config.get('store'), dict) else None
+    auto = auto_checkout(config)
+    # 每个账号只用一个送货方式；没有预设时沿用旧逻辑（有门店默认自提，全自动优先自提）。
+    preferred = {'delivery': 'HOME', 'pickup': 'RETAIL'}.get(config.get('delivery_method'))
+    if preferred and preferred in values:
+        mode = preferred
+        print('按本地送货方式预设：' + ('门店自提' if mode == 'RETAIL' else '快递配送') + '。')
+    elif preferred:
+        other = 'RETAIL' if preferred == 'HOME' else 'HOME'
+        if other not in values:
+            raise ValueError('当前商品既不支持配送也不支持自提，请检查购物袋。')
+        mode = other
+        print('本地预设的送货方式当前不可用，已改为' + ('门店自提' if mode == 'RETAIL' else '快递配送') + '。')
+    elif auto and preset and 'RETAIL' in values:
+        mode = 'RETAIL'  # 已预设门店 + 全自动：优先自提。
+    elif auto and 'HOME' in values:
+        mode = 'HOME'
+    elif auto and 'RETAIL' in values:
+        mode = 'RETAIL'
+    else:
+        # 优先自提：有预设门店且官网可选自提时，默认选中自提。
+        mode = choose('收货方式', options, 'RETAIL' if preset and 'RETAIL' in values else 'HOME')
     if mode != node.get('selectFulfillmentLocation'):
         flow.action(path + '.fulfillmentOptions', 'selectFulfillmentLocationAction',
                     {path + '.fulfillmentOptions.selectFulfillmentLocation': mode})
     payload = {path + '.fulfillmentOptions.selectFulfillmentLocation': mode}
     if mode == 'HOME':
         home_delivery(flow, config)
-        return
+        if preferred == 'RETAIL':
+            return '本地预设是门店自提，但这次下单没有可用的自提门店，已改为快递配送。'
+        return ''
     locator = path + '.pickupTab.pickup.storeLocator'
     node = flow.require(locator)
-    search = ask('自提门店所在城市/地区', value(node, 'd.searchInput', '') or config.get('delivery', {}).get('city', ''))
+    # 自提页的地区要先切到预设地区：官网只按当前地区返回并按距离排序门店，
+    # 否则会在上一个地区里搜索，“就近自提”就选不到正确的门店。
     region = locator + '.address.stateCitySelectorForCheckout'
+    wanted = {key: ((preset or {}).get(key) or config.get('delivery', {}).get(key, '') or '')
+              for key in ('state', 'city', 'district')}
+    flow.require(region)
+    picked = region_data(flow, region, wanted, interactive=False) if any(wanted.values()) else {}
+    node = flow.require(locator)
+    search = (wanted['city'] or wanted['state'] or value(node, 'd.searchInput', ''))
     store_data = {locator + '.showAllStores': 'false', locator + '.selectStore': '', locator + '.searchInput': search}
-    store_data.update({region + '.' + k: value(flow.model, region + '.d.' + k, '')
-                      for k in ('state', 'city', 'district', 'provinceCityDistrict', 'countryCode')})
+    store_data.update(picked or {region + '.' + k: value(flow.model, region + '.d.' + k, '')
+                                 for k in ('state', 'city', 'district', 'provinceCityDistrict', 'countryCode')})
     flow.action(locator, 'search', store_data)
     stores = value(flow.model, locator + '.searchResults.d.retailStores', [])
     choices = []
@@ -302,15 +745,29 @@ def fulfillment(flow, config_path):
     no_stores = not choices
     delivery_available = any(o.get('value') == 'HOME' and not o.get('disabled')
                              for o in flow.require(path + '.fulfillmentOptions')['d'].get('options', []))
-    if delivery_available:
-        choices.append(('HOME', '为我送货（不选门店，改为配送）'))
-        if no_stores:
-            print('当前没有可选自提门店，可以改为送货。')
-    selected = choose('选择自提门店或改为送货（取货状态由官网返回）', choices,
-                      'HOME' if no_stores and delivery_available else None)
+    preset_id = (preset or {}).get('id')
+    note = ''
+    if no_stores:
+        if not delivery_available:
+            raise ValueError('当前地区与商品都没有可选的自提门店，也没有可用的送货方式，已停止。')
+        print('该地区当前没有可选自提门店，改为送货。')
+        region_text = ' '.join(part for part in wanted.values() if part)
+        note = '没有' + (region_text + ' ') + '可用的自提门店，已改为快递配送。'
+        selected = 'HOME'
+    elif preset_id and any(value_ == preset_id for value_, _ in choices):
+        # 旧配置指定的门店仍可自提：直接用它。
+        print('使用预设自提门店：' + str((preset or {}).get('name') or preset_id))
+        selected = preset_id
+    else:
+        # 就近自提：官网按距离返回门店，自动选第一家可选门店，避免指定门店没货。
+        if preset_id:
+            print('预设自提门店当前不可选，改为自动就近选择。')
+        selected = choices[0][0]
+        print('就近自提：自动选择 ' + choices[0][1])
+        note = '门店自提：已自动选择最近有货的门店——' + choices[0][1].split(' — ')[0] + '。'
     if selected == 'HOME':
         home_delivery(flow, config)
-        return
+        return note
     store_data[locator + '.selectStore'] = selected
     flow.action(locator, 'select', store_data)
     if value(flow.model, locator + '.d.selectStore') != selected:
@@ -320,18 +777,27 @@ def fulfillment(flow, config_path):
     if value(flow.model, forced + '.shipmentGroups'):
         print('此订单包含必须配送的商品，继续配置送货地区和配送服务。')
         payload.update(region_data(flow, forced + '.deliveryLocation.address.provinceCityDistrictTabsForCheckout', config.get('delivery'), prefer_current=True))
-        payload.update(shipping_options(flow, forced + '.shipmentGroups'))
+        payload.update(shipping_options(flow, forced + '.shipmentGroups', auto_checkout(config)))
     flow.action(path, 'continueFromFulfillmentToPickupContact', payload)
     flow.require('checkout.pickupContact')
     pickup_contact(flow, config, config_path)
+    return note
 
 
-def shipping(flow, config_path, auth_path=None):
+def shipping(flow, config_path, auth_path=None, auto=None):
     if value(flow.model, 'checkout.d.page') == 'Billing':
         flow.require('checkout.billing')
         return  # 纯自提没有收货地址步骤。
     path = 'checkout.shipping'
     node = flow.require(path)
+    # 只有全自动下单才需要提前知道本地快捷地址，其余情况保持“不读本地预设”的行为。
+    preset_state = {}
+
+    def preset_ready():
+        if 'ready' not in preset_state:
+            preset_state['ready'] = preset_complete(read_config(config_path))
+        return preset_state['ready']
+
     selector = node['addressSelector']['d']
     saved = [a for a in selector.get('radioAddresses', [])
              if a.get('isSavedAddress') and a.get('addressLine1') and a.get('value')
@@ -344,7 +810,14 @@ def shipping(flow, config_path, auth_path=None):
         current = saved[0]
     can_add = any(a.get('value') == 'newAddr' and not a.get('disabled')
                   for a in selector.get('radioAddresses', []))
-    if saved:
+    if auto and can_add and preset_ready():
+        selected = 'newAddr'  # 已填好本地快捷地址，全自动下单不再询问。
+        print('全自动下单：使用本地快捷地址。')
+    elif auto and current is not None:
+        selected = current['value']
+    elif auto and len(saved) == 1:
+        selected = saved[0]['value']
+    elif saved:
         choices = [('saved', '使用官网已有的地址')]
         if can_add:
             choices.append(('newAddr', '使用本地快捷地址进行配置'))
@@ -363,13 +836,12 @@ def shipping(flow, config_path, auth_path=None):
         print('使用官网已保存地址：' + str(current.get('provinceCityDistrict', '')) + ' ' + str(current['addressLine1']))
     payload = {path + '.addressSelector.selectAddress': selected}
     if selected == 'newAddr':
-        config = read_config(config_path)
-        if not config.get('address', {}).get('street') or not config.get('delivery'):
+        if not preset_ready():
             if auth_path is None:
                 configure_address(config_path)
             else:
                 configure_address(config_path, auth_path)
-            config = read_config(config_path)
+        config = read_config(config_path)
         details = contact(config)
         config['contact'] = details
         save_config(config_path, config)

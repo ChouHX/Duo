@@ -31,7 +31,9 @@ def replace_release(staging, destination):
 def main():
     if sys.platform not in ('darwin', 'win32'):
         raise SystemExit('当前打包支持 macOS 和 Windows。')
-    pnpm = shutil.which('pnpm')
+    # Windows 上优先用 pnpm.cmd：Git-Bash/MSYS 的 PATH 里可能同时有没有扩展名的
+    # shell 脚本 shim，CreateProcess 无法执行它（WinError 193）。
+    pnpm = shutil.which('pnpm.cmd') or shutil.which('pnpm')
     if not pnpm:
         raise SystemExit('请先安装 pnpm。')
     python = ROOT / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')

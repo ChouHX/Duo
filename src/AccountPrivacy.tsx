@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, type ReactNode } from "react";
+import { Button, Tooltip } from "antd";
 import { Eye, EyeOff } from "lucide-react";
 
 export function maskAccount(value: string) {
@@ -31,7 +32,8 @@ export function useAccountPrivacy() {
   const state = useContext(Privacy);
   return {
     ...state,
-    format: (value: string) => (state.revealed ? value : maskAccount(value)),
+    format: (value?: string) =>
+      state.revealed || !value ? value || "" : maskAccount(value),
   };
 }
 
@@ -39,17 +41,16 @@ export function AccountPrivacyToggle() {
   const { revealed, setRevealed } = useAccountPrivacy();
   const label = revealed ? "隐藏完整账号" : "显示完整账号";
   return (
-    <button
-      type="button"
-      className="icon-button privacy-toggle"
-      aria-label={label}
-      title={label}
-      aria-pressed={revealed}
-      onClick={() => setRevealed(!revealed)}
-    >
-      <span key={String(revealed)}>
-        {revealed ? <EyeOff size={16} /> : <Eye size={16} />}
-      </span>
-    </button>
+    <Tooltip title={label}>
+      <Button
+        type="text"
+        size="small"
+        className="privacy-toggle"
+        aria-label={label}
+        aria-pressed={revealed}
+        icon={revealed ? <EyeOff /> : <Eye />}
+        onClick={() => setRevealed(!revealed)}
+      />
+    </Tooltip>
   );
 }

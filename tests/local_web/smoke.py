@@ -96,7 +96,8 @@ def main(package):
             b = call('add_account', name='测试 B', email='b@example.test')
             assert a['pending'] is True and b['pending'] is True
             request('/api/start_task', {'accountId': a['id'], 'action': 'purchase', 'params': {}}, expected=400)
-            call('save_preset', accountId=a['id'], sku='MLH74FE', quantity=3)
+            call('save_preset', accountId=a['id'],
+                 items=[{'sku': 'MLH74FE', 'quantity': 3}, {'sku': 'MJTA4CH', 'quantity': 1}])
             request('/api/add_account', {'email': a['email']}, expected=400)
             request('/api/start_task', {'accountId': a['id'], 'action': 'unknown', 'params': {}}, expected=400)
 
@@ -139,6 +140,8 @@ def main(package):
             assert len(restored['accounts']) == 2
             assert all(account['pending'] for account in restored['accounts'])
             assert restored['accounts'][0]['preset_quantity'] == 3
+            assert restored['accounts'][0]['preset_items'] == [{'sku': 'MLH74FE', 'quantity': 3},
+                                                              {'sku': 'MJTA4CH', 'quantity': 1}]
             assert any(t['id'] == first for t in restored['tasks'])
             # Remove only synthetic accounts after restart (no worker still closing).
             call('remove_account', accountId=a['id'])

@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -451,6 +451,51 @@ class LoginTests(unittest.TestCase):
         self.assertNotIn("SECRET", str(caught.exception))
         self.assertIn("-20101", str(caught.exception))
 
+    def test_transient_http_errors_say_the_site_is_down_not_the_account(self):
+        """503 / 429 的文案必须让用户知道“稍后重试”，而不是去改密码。"""
+        for status in (429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                with self.assertRaises(LoginError) as caught:
+                    AppleStoreLogin.expect(response({}, status), (200,))
+                message = str(caught.exception)
+                self.assertEqual(caught.exception.status, status)
+                self.assertIn(f"HTTP {status}", message)
+                self.assertIn("账号与本地配置已保留", message)
+                self.assertNotIn("请求失败：", message)
+        with self.assertRaises(LoginError) as caught:
+            AppleStoreLogin.expect(response({}, 541), (200,))
+        self.assertIn("反爬拦截", str(caught.exception))
+
+    def test_transient_status_excludes_541_and_client_errors(self):
+        from apple_login import is_transient_status
+        for status in (429, 500, 502, 503, 504, 599):
+            self.assertTrue(is_transient_status(status), status)
+        for status in (200, 301, 400, 401, 403, 404, 409, 541):
+            self.assertFalse(is_transient_status(status), status)
+
+    def test_get_retries_transient_failures_but_post_does_not(self):
+        client = AppleStoreLogin()
+        client.transient_retry_delay = 0
+        replies = [response({}, 503), response({}, 429), response({"ok": True})]
+        with patch.object(client, "request", side_effect=replies) as request:
+            self.assertEqual(client.request_retrying("GET", "https://www.apple.com.cn/").status_code, 200)
+        self.assertEqual(request.call_count, 3)
+
+        client = AppleStoreLogin()
+        client.transient_retry_delay = 0
+        with patch.object(client, "request", return_value=response({}, 503)) as request:
+            self.assertEqual(client.request_retrying("POST", AUTH + "/signin/complete").status_code, 503)
+        self.assertEqual(request.call_count, 1)
+
+    def test_page_gives_up_after_retries_with_a_readable_message(self):
+        client = AppleStoreLogin()
+        client.transient_retry_delay = 0  # 测试不真的等待退避。
+        with patch.object(client, "request", return_value=response({}, 503)) as request:
+            with self.assertRaises(LoginError) as caught:
+                client.page("https://secure9.www.apple.com.cn/shop/signIn")
+        self.assertEqual(request.call_count, client.transient_retries)
+        self.assertIn("官网暂时不可用", str(caught.exception))
+
     def test_auth_credentials_error_explains_config_without_disclosing_response(self):
         for status, code in ((401, "-20101"), (401, "other"), (400, "-21669")):
             with self.subTest(status=status, code=code), tempfile.TemporaryDirectory() as temp:
@@ -594,6 +639,61 @@ class BrowserInitializationTests(unittest.TestCase):
             restored_page.close.assert_called_once_with()
             launcher.launch.assert_not_called()
             launcher.launch_persistent_context.assert_not_called()
+
+    @contextlib.contextmanager
+    def harvest(self, temp):
+        """搭一个最小可用的 Chrome CDP 环境，返回 (client, page, context)。"""
+        def cookie(name):
+            return {"name": name, "value": "test-context", "domain": ".apple.com.cn",
+                    "path": "/", "secure": True, "expires": -1, "httpOnly": True}
+        with patch("playwright.sync_api.sync_playwright") as factory, \
+                patch("apple_login.subprocess.Popen") as process_factory, \
+                patch("apple_login.Path.is_file", return_value=True), \
+                patch("requests.utils.get_environ_proxies", return_value={}):
+            process_factory.return_value.poll.return_value = None
+            client = AppleStoreLogin(auth_path=Path(temp) / "auth.json")
+            browser = factory.return_value.__enter__.return_value.chromium.connect_over_cdp.return_value
+            context = browser.contexts[0]
+            browser.contexts = [context]
+            context.pages = []
+            page = context.new_page.return_value
+
+            def open_page():
+                context.pages = [page]
+                return page
+
+            context.new_page.side_effect = open_page
+            page.evaluate.return_value = "real-chrome-UA"
+            context.cookies.return_value = [cookie("shld_bt_ck"), cookie("as_pcts")]
+            yield client, page, context
+
+    def test_http_error_pages_still_yield_a_usable_context(self):
+        """官网对新配置常回 403/429/541，这些响应照样下发上下文 Cookie，不能直接判失败。"""
+        with tempfile.TemporaryDirectory() as temp, self.harvest(temp) as (client, page, _context):
+            page.goto.return_value.status = 541
+            self.assertTrue(client.initialize_browser_context())
+            self.assertEqual(client.session.cookies.get("shld_bt_ck"), "test-context")
+            self.assertEqual(client.session.headers["User-Agent"], "real-chrome-UA")
+            # 首页与购物袋页都要走到，且不能退回 wait_until="load"（子资源多，极易超时）。
+            self.assertEqual([call.args[0] for call in page.goto.call_args_list],
+                             ["https://www.apple.com.cn/", "https://www.apple.com.cn/shop/bag"])
+            self.assertTrue(all(call.kwargs["wait_until"] == "domcontentloaded"
+                                for call in page.goto.call_args_list))
+
+    def test_navigation_timeout_does_not_discard_a_ready_context(self):
+        from playwright.sync_api import Error as BrowserError
+        with tempfile.TemporaryDirectory() as temp, self.harvest(temp) as (client, page, _context):
+            page.goto.side_effect = BrowserError("Timeout 45000ms exceeded")
+            self.assertTrue(client.initialize_browser_context())
+            self.assertEqual(client.session.cookies.get("shld_bt_ck"), "test-context")
+
+    def test_missing_context_reports_the_http_status(self):
+        with tempfile.TemporaryDirectory() as temp, self.harvest(temp) as (client, page, context):
+            page.goto.return_value.status = 541
+            context.cookies.return_value = []
+            with self.assertRaisesRegex(LoginError, "HTTP 541") as caught:
+                client.initialize_browser_context()
+            self.assertIn("尚未取得所需浏览器上下文", str(caught.exception))
 
     def test_missing_context_closes_owned_browser_and_keeps_session(self):
         with tempfile.TemporaryDirectory() as temp, patch("playwright.sync_api.sync_playwright") as factory, \
@@ -1223,6 +1323,68 @@ class PurchaseFlowTests(unittest.TestCase):
                        "placeOrder": {"d": {"enableContinue": True}},
                        "billingReview": {"alipayReview": {"d": {"alipayLabel": "ALIPAY"}}}}}}
 
+    def applecare_cart(self):
+        return {"items": {
+            "item-phone": {"d": {"sku": "MJTA4CH/A", "name": "iPhone 18 Pro 256GB"},
+                           "itemQuantity": {"d": {"quantity": 1}},
+                           "inlineRecommendations": {"c": ["sHHY3CH/A", "other-SKU"],
+                               "sHHY3CH/A": {"d": {"isAppleCare": True, "title": "AppleCare+ 服务计划",
+                                                    "price": "RMB 1,799"},
+                                             "a": {"add": {"url": "/shop/bagx?_a=add", "submit": True}}},
+                               "other-SKU": {"d": {"isAppleCare": False}}}}}}
+
+    def test_applecare_added_only_when_preset_enables_it(self):
+        flow = duo_killer.Checkout(None)
+        flow.require = lambda path: self.applecare_cart()
+        flow.action = Mock(side_effect=lambda *a, **k: flow.require("shoppingCart"))
+        with patch.object(duo_killer, "request_get") as beacon,                 contextlib.redirect_stdout(io.StringIO()) as output:
+            added = duo_killer.add_applecare(flow, False)
+        self.assertEqual(added, [])
+        flow.action.assert_not_called()
+        beacon.assert_not_called()
+        self.assertIn("保持裸机", output.getvalue())
+
+    def test_applecare_action_targets_inline_recommendation(self):
+        flow = duo_killer.Checkout(None)
+        cart = self.applecare_cart()
+
+        def fake_action(module, name, data=None):
+            self.assertEqual(module, "shoppingCart.items.item-phone.inlineRecommendations.sHHY3CH/A")
+            self.assertEqual(name, "add")
+            cart["items"]["item-phone"]["inlineRecommendations"]["c"] = ["other-SKU"]
+            return None
+
+        flow.require = lambda path: cart
+        flow.action = Mock(side_effect=fake_action)
+        with patch.object(duo_killer, "request_get") as beacon,                 contextlib.redirect_stdout(io.StringIO()):
+            added = duo_killer.add_applecare(flow, True)
+        self.assertEqual([a["title"] for a in added], ["AppleCare+ 服务计划"])
+        beacon.assert_called_once()
+
+    def test_applecare_failure_stops_the_order(self):
+        flow = duo_killer.Checkout(None)
+        flow.require = lambda path: self.applecare_cart()
+        flow.action = Mock(return_value=None)  # 推荐没消失 = 没加成功
+        with patch.object(duo_killer, "request_get"),                 contextlib.redirect_stdout(io.StringIO()),                 self.assertRaisesRegex(ValueError, r"AppleCare\+ 未确认加入"):
+            duo_killer.add_applecare(flow, True)
+
+    def test_applecare_enabled_reads_local_preset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.object(duo_killer, "ROOT", root):
+                self.assertFalse(duo_killer.applecare_enabled())
+                (root / "checkout.json").write_text('{"applecare": true}', encoding="utf-8")
+                self.assertTrue(duo_killer.applecare_enabled())
+            # 账号配置缺字段时回退到通用预设
+            general = root / "settings" / "checkout.json"
+            account = root / "accounts" / "abc" / "checkout.json"
+            account.parent.mkdir(parents=True)
+            general.parent.mkdir(parents=True)
+            general.write_text('{"applecare": true}', encoding="utf-8")
+            account.write_text("{}", encoding="utf-8")
+            with patch.object(duo_killer, "ROOT", account.parent):
+                self.assertTrue(duo_killer.applecare_enabled())
+
     def test_check_login_add_and_pay_in_order(self):
         for logged_in in (True, False):
             with self.subTest(logged_in=logged_in), tempfile.TemporaryDirectory() as temp, \
@@ -1302,16 +1464,200 @@ class PurchaseFlowTests(unittest.TestCase):
                     duo_killer.confirm_order(model)
                 prompt.assert_not_called()
 
+    def test_normalize_items_merges_and_validates(self):
+        self.assertEqual(
+            duo_killer.normalize_items([{"sku": "mk2u4ch", "quantity": 2},
+                                        {"sku": "MK2U4CH/A", "quantity": 1},
+                                        {"sku": "mjta4ch", "quantity": 2}]),
+            [("MK2U4CH/A", 3), ("MJTA4CH/A", 2)])
+        # 单个字典、只写 SKU 的列表、已规整的二元组都能接受。
+        self.assertEqual(duo_killer.normalize_items({"sku": "MK2U4CH", "quantity": 2}), [("MK2U4CH/A", 2)])
+        self.assertEqual(duo_killer.normalize_items(["mk2u4ch", "mjta4ch"]),
+                         [("MK2U4CH/A", 1), ("MJTA4CH/A", 1)])
+        self.assertEqual(duo_killer.normalize_items([("MK2U4CH/A", 2)]), [("MK2U4CH/A", 2)])
+        for bad in ([], "x", [{"sku": "MK2U4CH", "quantity": 0}],
+                    [{"sku": "bad", "quantity": 1}], [{"sku": "MK2U4CH", "quantity": "2"}], [1]):
+            with self.assertRaises(ValueError):
+                duo_killer.normalize_items(bad)
+        with self.assertRaisesRegex(ValueError, "10 种"):
+            duo_killer.normalize_items([{"sku": f"MK2U4C{i}", "quantity": 1} for i in range(11)])
+        with self.assertRaisesRegex(ValueError, "超过 999"):
+            duo_killer.normalize_items([{"sku": "MK2U4CH", "quantity": 999},
+                                        {"sku": "MK2U4CH/A", "quantity": 1}])
+
+    def test_add_items_adds_every_product_to_one_bag(self):
+        cart = {"summary": {"d": {"total": "RMB 13,800"}},
+                "items": {"item-1": {"d": {"sku": "MK2U4CH/A"}, "itemQuantity": {"d": {"quantity": 2}}},
+                          "item-2": {"d": {"sku": "MJTA4CH/A"}, "itemQuantity": {"d": {"quantity": 1}}}}}
+
+        class Flow:
+            session = None
+
+            def require(self, path):
+                return cart
+
+        calls = []
+
+        def fake_add(part, quantity=1, *, set_total=False, flow=None):
+            calls.append((part, quantity, set_total))
+            return {"success": True, "part": part,
+                    "items": [{"item_id": "item-x", "part": part, "quantity": quantity}]}
+
+        with patch.object(duo_killer, "add_to_bag", fake_add):
+            result = duo_killer.add_items([{"sku": "MK2U4CH", "quantity": 2},
+                                           {"sku": "MJTA4CH", "quantity": 1}], flow=Flow())
+        self.assertEqual(calls, [("MK2U4CH/A", 2, True), ("MJTA4CH/A", 1, True)])
+        self.assertEqual(result["bag"], [{"sku": "MJTA4CH/A", "quantity": 1},
+                                         {"sku": "MK2U4CH/A", "quantity": 2}])
+        self.assertEqual(result["items"][0], {"part": "MK2U4CH/A", "quantity": 2})
+        self.assertEqual(result["bag_total"], "RMB 13,800")
+
+    def test_wait_until_returns_promptly_when_past(self):
+        started = time.monotonic()
+        duo_killer.wait_until(time.time() - 5, None, "测试")
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_ensure_bag_retries_until_the_bag_matches(self):
+        calls = []
+        state = {"missing": 2}
+
+        def fake_add(part, quantity=1, *, set_total=False, flow=None):
+            calls.append((part, quantity))
+            state["missing"] -= 1
+            return {"success": True}
+
+        with patch.object(duo_killer, "bag_missing", lambda flow, targets: [("MK2U4CH/A", 2)] if state["missing"] else []), \
+                patch.object(duo_killer, "add_to_bag", fake_add), \
+                patch.object(duo_killer.time, "sleep", lambda _seconds: None):
+            duo_killer.ensure_bag(None, [("MK2U4CH/A", 2)], attempts=5)
+        self.assertEqual(len(calls), 2)
+
+    def test_ensure_bag_gives_up_with_a_clear_message(self):
+        with patch.object(duo_killer, "bag_missing", lambda flow, targets: [("MK2U4CH/A", 2)]), \
+                patch.object(duo_killer, "add_to_bag", side_effect=ValueError("加购接口未确认成功")), \
+                patch.object(duo_killer.time, "sleep", lambda _seconds: None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "未能加入购物袋"):
+                duo_killer.ensure_bag(None, [("MK2U4CH/A", 2)], attempts=3)
+
+    def test_timed_purchase_warms_up_before_the_moment(self):
+        events = []
+        flow = object()
+        with self.auth_file() as auth, \
+                patch.object(duo_killer, "AUTH_PATH", auth), \
+                patch.object(duo_killer, "ensure_auth_file"), \
+                patch.object(duo_killer, "load_auth"), \
+                patch.object(duo_killer, "save_auth"), \
+                patch.object(duo_killer, "ensure_strong_login", return_value=False), \
+                patch.object(duo_killer, "prepare_flow",
+                             side_effect=lambda *a, **k: events.append("login") or flow), \
+                patch.object(duo_killer, "ensure_bag",
+                             side_effect=lambda *a, **k: events.append("bag")), \
+                patch.object(duo_killer, "pay_bag",
+                             side_effect=lambda **k: events.append("pay") or {"success": True}), \
+                patch.object(duo_killer.requests, "Session"), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            at = time.time() + 0.4
+            result = duo_killer.timed_purchase([{"sku": "MK2U4CH", "quantity": 2}],
+                                               at=at, warmup=1, probe=lambda: None)
+        self.assertTrue(result["success"])
+        # 先预热（登录 + 加购），到点再补齐并结账一次。
+        self.assertEqual(events, ["login", "bag", "bag", "pay"])
+        self.assertIn("预热完成", output.getvalue())
+        self.assertIn("到点，开始下单", output.getvalue())
+
+    def test_timed_purchase_retries_login_when_warmup_fails(self):
+        events = []
+        flow = object()
+        with self.auth_file() as auth, \
+                patch.object(duo_killer, "AUTH_PATH", auth), \
+                patch.object(duo_killer, "ensure_auth_file"), \
+                patch.object(duo_killer, "load_auth"), \
+                patch.object(duo_killer, "save_auth"), \
+                patch.object(duo_killer, "ensure_strong_login", side_effect=[ValueError("预热时登录失败"), False]), \
+                patch.object(duo_killer, "prepare_flow",
+                             side_effect=lambda *a, **k: events.append("login") or flow), \
+                patch.object(duo_killer, "ensure_bag",
+                             side_effect=lambda *a, **k: events.append("bag")), \
+                patch.object(duo_killer, "pay_bag",
+                             side_effect=lambda **k: events.append("pay") or {"success": True}), \
+                patch.object(duo_killer.requests, "Session"), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            result = duo_killer.timed_purchase([{"sku": "MK2U4CH", "quantity": 1}],
+                                               at=time.time(), warmup=300, probe=lambda: None)
+        self.assertTrue(result["success"])
+        self.assertEqual(events, ["login", "bag", "pay"])
+        self.assertIn("预热未完成", output.getvalue())
+
+    @contextlib.contextmanager
+    def auth_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "auth.json"
+            path.write_text("{}", encoding="utf-8")
+            yield path
+
+    def test_timed_purchase_rejects_past_and_invalid_times(self):
+        with self.assertRaisesRegex(ValueError, "抢购时间已经过去"):
+            duo_killer.timed_purchase([{"sku": "MK2U4CH", "quantity": 1}],
+                                      at=time.time() - 600, warmup=60)
+        with self.assertRaises(ValueError):
+            duo_killer.timed_purchase([{"sku": "MK2U4CH", "quantity": 1}], at="soon")
+
+    def test_order_price_reads_messy_amounts(self):
+        self.assertEqual(duo_killer.order_price("RMB 9,999"), "RMB 9,999")
+        self.assertEqual(duo_killer.order_price("总计：RMB 11,798（含税）"), "RMB 11,798")
+        self.assertEqual(duo_killer.order_price("RMB 11,798/月"), "RMB 11,798")
+        self.assertEqual(duo_killer.order_price("CNY 11 798"), "CNY 11 798")
+        self.assertEqual(duo_killer.order_price("￥9,999元"), "￥9,999")
+        self.assertEqual(duo_killer.order_price({"value": "11,798", "currencyCode": "RMB"}), "RMB 11,798")
+        self.assertEqual(duo_killer.order_price(9999), "9,999")
+        # 只读场景没有金额时返回空串，不再整单失败。
+        self.assertEqual(duo_killer.order_price(None, context="购物袋", required=False), "")
+        self.assertEqual(duo_killer.order_price("免费", required=False), "")
+        # 下单前核对总额时仍然会停止，但错误里带上官网返回值，便于排查。
+        with self.assertRaisesRegex(ValueError, "官网返回：暂未计算"):
+            duo_killer.order_price("暂未计算")
+        with self.assertRaisesRegex(ValueError, "购物袋缺少可识别的金额"):
+            duo_killer.order_price(None, context="购物袋")
+
+    def test_auto_checkout_defaults_to_on(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(duo_killer, "ROOT", Path(temp)):
+            self.assertTrue(duo_killer.checkout_auto())  # 没有配置文件也算开启
+            (Path(temp) / "checkout.json").write_text("{}", encoding="utf-8")
+            self.assertTrue(duo_killer.checkout_auto())  # 没写过这个字段也算开启
+            (Path(temp) / "checkout.json").write_text(json.dumps({"auto_checkout": False}), encoding="utf-8")
+            self.assertFalse(duo_killer.checkout_auto())  # 只有明确关掉才关闭
+
+    def test_auto_checkout_inherits_general_preset(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(duo_killer, "ROOT", Path(temp)):
+            root = Path(temp)
+            general = root / "settings" / "checkout.json"
+            account = root / "accounts" / "abc" / "checkout.json"
+            account.parent.mkdir(parents=True)
+            general.parent.mkdir(parents=True)
+            general.write_text(json.dumps({"auto_checkout": False}), encoding="utf-8")
+            account.write_text("{}", encoding="utf-8")
+            with patch.object(duo_killer, "ROOT", account.parent):
+                self.assertFalse(duo_killer.checkout_auto())  # 通用预设关掉，账号跟随
+            account.write_text(json.dumps({"auto_checkout": True}), encoding="utf-8")
+            with patch.object(duo_killer, "ROOT", account.parent):
+                self.assertTrue(duo_killer.checkout_auto())  # 账号自己的设置优先
+
     def test_order_is_submitted_only_after_enter_confirmation(self):
         for answer in ("", "n", " ", EOFError(), KeyboardInterrupt()):
             with self.subTest(answer=type(answer).__name__ if isinstance(answer, BaseException) else repr(answer)), \
                     tempfile.TemporaryDirectory() as temp, patch.object(duo_killer, "ROOT", Path(temp)), \
                     patch.object(duo_killer, "authenticate"), patch.object(duo_killer, "save_auth"), \
                     patch.object(duo_killer, "Checkout") as factory, \
-                    patch.object(duo_killer, "reauthenticate_checkout"), patch.object(duo_killer, "checkout_delivery"), \
+                    patch.object(duo_killer, "reauthenticate_checkout"), \
+                    patch.object(duo_killer, "checkout_delivery", return_value=""), \
                     patch.object(duo_killer, "checkout_shipping"), \
                     patch.object(duo_killer, "finish_payment", return_value={"success": True}) as finish, \
                     patch.object(duo_killer, "payment_qr") as qr, contextlib.redirect_stdout(io.StringIO()):
+                # 这个用例验证"非全自动"时的二次确认：显式关掉缺省启用的全自动下单。
+                (Path(temp) / "checkout.json").write_text(
+                    json.dumps({"auto_checkout": False}), encoding="utf-8")
                 flow = factory.return_value
                 flow.model = self.review_model()
                 flow.require.side_effect = lambda path: duo_killer.field(flow.model, path)

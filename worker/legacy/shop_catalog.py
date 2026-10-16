@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from html import unescape
 import json
 import re
+import time
 import unicodedata
 from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
@@ -12,6 +13,8 @@ import requests
 
 STORE_URL = "https://www.apple.com.cn/store"
 DUO_URL = "https://www.apple.com.cn/shop/buy-iphone/iphone-duo"
+# 官网处于开售前「封面 / 等待室」模式时会用这套页面替换商城页（通常带 HTTP 503）。
+COVER_MARKERS = ("rs-covers", "coversModeType")
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
            "Accept-Language": "zh-CN,zh;q=0.9"}
@@ -100,14 +103,41 @@ def series_skus(html):
     return result
 
 
+def cover_page(html):
+    """官网开售前的「封面 / 等待室」页，不是真正的商品页。"""
+    return any(marker in (html or "") for marker in COVER_MARKERS)
+
+
+def cover_message(status):
+    return (f"Apple 官网当前返回的是「发售等待室」页面（HTTP {status}）："
+            "官网正处在开售前的排队/封面模式，公共商品页暂时不对外提供服务。"
+            "这是官网侧的临时状态，不是账号或本地配置的问题；请稍后重试，"
+            "或先在浏览器打开 apple.com.cn/store 确认是否仍在排队。")
+
+
 def fetch_public(request_get, url):
     # 每个请求独立使用匿名会话；不共享或写回 auth.json。
+    from apple_login import (TRANSIENT_RETRIES, TRANSIENT_RETRY_DELAY,
+                             describe_http_failure, is_transient_status)
     with requests.Session() as session:
         session.headers.update(HEADERS)
-        response = request_get(session, "查询商店推荐", url, allow_redirects=False)
-        if response.status_code != 200:
+        attempt = 0
+        while True:
+            attempt += 1
+            response = request_get(session, "查询商店推荐", url, allow_redirects=False)
+            if response.status_code == 200:
+                return response.text
+            # 503 / 502 / 504 / 429 是官网侧瞬时故障，几秒后往往自行恢复。
+            if is_transient_status(response.status_code) and attempt < TRANSIENT_RETRIES:
+                delay = TRANSIENT_RETRY_DELAY * attempt
+                time.sleep(delay)
+                continue
+            # 开售前的封面页同样是 5xx，但它重试也不会变成商品页，需单独说明。
+            if cover_page(response.text):
+                raise ValueError(cover_message(response.status_code))
+            if is_transient_status(response.status_code):
+                raise ValueError(describe_http_failure(response.status_code, ()))
             raise ValueError(f"商品页查询失败：HTTP {response.status_code}")
-        return response.text
 
 
 def duo_status(html):

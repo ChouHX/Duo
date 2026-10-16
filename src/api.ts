@@ -1,17 +1,22 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { Account, Action, Data, Snapshot, Task } from "./types";
+import type {
+  Account,
+  Action,
+  Data,
+  PresetItem,
+  Snapshot,
+  Task,
+} from "./types";
 import { localWebBridge } from "./web-api";
 export const isLocalWeb = import.meta.env.MODE === "local-web";
 export interface Bridge {
   snapshot(): Promise<Snapshot>;
   add(email: string): Promise<Account>;
   remove(accountId: string): Promise<void>;
-  savePreset(
-    accountId: string,
-    sku: string,
-    quantity: number,
-  ): Promise<Account>;
+  savePreset(accountId: string, items: PresetItem[]): Promise<Account>;
+  // 用系统默认浏览器打开链接（桌面版的 webview 不支持 target=_blank）。
+  openUrl(url: string): Promise<void>;
   start(accountId: string, action: Action, params: Data): Promise<string>;
   reply(
     accountId: string,
@@ -31,8 +36,8 @@ const native: Bridge = {
   snapshot: () => invoke("snapshot"),
   add: (email) => invoke("add_account", { email }),
   remove: (accountId) => invoke("remove_account", { accountId }),
-  savePreset: (accountId, sku, quantity) =>
-    invoke("save_preset", { accountId, sku, quantity }),
+  savePreset: (accountId, items) => invoke("save_preset", { accountId, items }),
+  openUrl: (url) => invoke("open_url", { url }),
   start: (accountId, action, params) =>
     invoke("start_task", { accountId, action, params }),
   reply: (accountId, taskId, requestId, value) =>

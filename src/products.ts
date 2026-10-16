@@ -9,8 +9,13 @@ export const duoProducts = [
   { sku: "MK2V4CH", name: "iPhone Duo 2TB Star White", price: 26499 },
   { sku: "MK2T4CH", name: "iPhone Duo 1TB Star White", price: 21499 },
 ];
+// 实测自 apple.com.cn（购物袋 / 商品页），仅作快捷选择。
+const iphone18Pro = [
+  { sku: "MJTA4CH", name: "iPhone 18 Pro 256GB 冰川蓝色", price: 9999 },
+];
 export const presetProducts = [
   ...duoProducts,
+  ...iphone18Pro,
   { sku: "MLH74FE", name: "抛光布", price: 69 },
 ];
 export const priceText = (value: unknown) =>

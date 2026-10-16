@@ -7,7 +7,8 @@ from unittest.mock import patch
 import requests
 
 import duo_killer
-from shop_catalog import DUO_URL, STORE_URL, duo_status, query_duo, query_store, recommendations, series_skus
+from shop_catalog import (DUO_URL, STORE_URL, cover_page, duo_status, query_duo, query_store,
+                          recommendations, series_skus)
 
 
 def fixture():
@@ -133,6 +134,35 @@ class ShopTests(unittest.TestCase):
             return reply("blocked", 541)
         with self.assertRaisesRegex(ValueError, "HTTP 541"):
             query_duo(fetch)
+
+    def test_cover_page_is_reported_as_launch_waiting_room(self):
+        self.assertTrue(cover_page("<script>config.coversModeType='preorder_full'</script>"))
+        self.assertFalse(cover_page('<script id="metrics">{"products": []}</script>'))
+        calls = []
+
+        def fetch(session, stage, url, **kwargs):
+            calls.append(url)
+            return reply("<div id='app' class='rs-covers'>preorder</div>", 503)
+
+        with patch("shop_catalog.time.sleep") as sleep:
+            with self.assertRaisesRegex(ValueError, "发售等待室"):
+                query_duo(fetch)
+        # 瞬时 503 会按退避重试，但仍识别为封面页，而不是伪装成账号故障。
+        self.assertEqual(len(calls), 3)
+        sleep.assert_called()
+
+    def test_transient_503_is_retried_then_succeeds(self):
+        html = '<script>window.PRODUCT_SELECTION_BOOTSTRAP = {productSelectionData: ' + json.dumps({"products": [
+            {"partNumber": "AAAAACH/A", "familyType": "iphoneduo", "comingSoon": True}]}) + '};</script>'
+        replies = [reply("<html>503</html>", 503), reply(html)]
+
+        def fetch(session, stage, url, **kwargs):
+            return replies.pop(0)
+
+        with patch("shop_catalog.time.sleep"):
+            result = query_duo(fetch)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["items"][0]["sku"], "AAAAACH/A")
 
     def test_duo_cli_does_not_authenticate_or_mutate_bag(self):
         with patch("shop_catalog.query_duo", return_value={"success": True}) as query, \

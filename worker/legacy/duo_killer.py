@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
@@ -605,8 +606,9 @@ def add_to_bag(part=PART, quantity=1, *, set_total=False, flow=None):
             item_id, item = cart_item(flow, part)
             if item is None or int(field(item, "itemQuantity.d.quantity", 0)) != target:
                 raise ValueError("服务器返回数量与目标不一致，已停止；请先查袋，不要直接重复加购。")
-            line_total = order_price(field(item, "d.totalPrice"))
-            bag_total = order_price(field(flow.model, "shoppingCart.summary.d.total"))
+            line_total = order_price(field(item, "d.totalPrice"), context="购物袋", required=False)
+            bag_total = order_price(field(flow.model, "shoppingCart.summary.d.total"),
+                                    context="购物袋", required=False)
             print(f"购物袋已确认：{part} × {target}，小计 {line_total}，购物袋总金额 {bag_total}")
             return {"success": True, "part": part, "added_quantity": max(0, target - before),
                     "item_ids": [item_id], "items": [{"item_id": item_id, "part": part, "quantity": target}],
@@ -722,13 +724,33 @@ class Checkout:
         if meta.get("page", {}).get("htmlUrl"):
             self.url = self.apple_url(meta["page"]["htmlUrl"])
 
+    def fetch_page(self, url, stage):
+        """GET 一个页面，容忍官网的瞬时故障。
+
+        503 / 502 / 504 / 429 是官网侧的临时状态，几秒后往往自行恢复；这里重试后再报错，
+        既避免一次抖动被当成“会话失效”，也避免出现用户无法照着行动的报错文案。
+        """
+        from apple_login import (TRANSIENT_RETRIES, TRANSIENT_RETRY_DELAY,
+                                 describe_http_failure, is_transient_status)
+        attempt = 0
+        while True:
+            attempt += 1
+            response = request_get(self.session, stage, url, allow_redirects=False,
+                                   headers={"Referer": self.url})
+            if response.status_code < 400:
+                return response
+            if attempt >= TRANSIENT_RETRIES or not is_transient_status(response.status_code):
+                raise ValueError(describe_http_failure(response.status_code, ()))
+            delay = TRANSIENT_RETRY_DELAY * attempt
+            log.warning("[%s] HTTP %s，%.1f 秒后重试（第 %s/%s 次）。",
+                        stage, response.status_code, delay, attempt, TRANSIENT_RETRIES - 1)
+            sleep(delay)
+
     def page(self, url, stage):
         # 显式处理跳转，商城令牌不会跟随跳转发送到支付平台。
         for _ in range(8):
             url = self.apple_url(url)
-            response = request_get(self.session, stage, url, allow_redirects=False,
-                                   headers={"Referer": self.url})
-            response.raise_for_status()
+            response = self.fetch_page(url, stage)
             if response.is_redirect:
                 url = urljoin(url, response.headers["Location"])
                 continue
@@ -809,12 +831,14 @@ def reauthenticate_checkout(flow):
 
 def checkout_delivery(flow):
     from checkout_options import fulfillment
-    fulfillment(flow, ROOT / "checkout.json")
+    # 返回送货方式的实际结果（例如自提没有门店时改为配送），供下单结果说明。
+    return fulfillment(flow, ROOT / "checkout.json") or ""
 
 
 def checkout_shipping(flow):
     from checkout_options import shipping
-    shipping(flow, ROOT / "checkout.json", AUTH_PATH)
+    # 全自动下单时不能再询问地址来源，这里把开关显式传下去。
+    shipping(flow, ROOT / "checkout.json", AUTH_PATH, auto=checkout_auto())
 
 
 def model_item_nodes(model):
@@ -842,14 +866,70 @@ def order_text(value):
     return " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text).split())
 
 
-def order_price(value):
-    text = order_text(value)
-    if not re.fullmatch(r"(?:RMB|CNY|CN¥|¥|￥|\$|USD)?\s*\d[\d,]*(?:\.\d{1,2})?\s*(?:元|RMB|CNY|USD)?", text):
-        raise ValueError("订单复核页缺少可识别的金额，已停止，未提交订单。")
-    return text
+# 金额可能带货币符号、千分位（半角/全角逗号或空格），也可能夹在"总计：… 含税"这类文字里。
+MONEY_WITH_CURRENCY = re.compile(
+    r"(?:RMB|CNY|CN¥|USD|US\$|\$|¥|￥)\s*(\d[\d,\s\u00a0，]*(?:\.\d{1,2})?)", re.I)
+MONEY_BARE = re.compile(
+    r"^\s*(\d[\d,\s\u00a0，]*(?:\.\d{1,2})?)\s*(?:元|RMB|CNY|USD)?\s*$", re.I)
 
 
-def confirm_order(model):
+def money_text(value, depth=0):
+    """把官网返回的价格字段（字符串 / 数字 / 结构化对象）转成可读文本。"""
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return f"{value:,.2f}".rstrip("0").rstrip(".") if isinstance(value, float) else f"{value:,}"
+    if isinstance(value, str):
+        return order_text(value)
+    if isinstance(value, dict) and depth < 3:
+        for key in ("display", "displayValue", "formattedValue", "text", "label",
+                    "amount", "value", "total", "totalPrice", "rawValue"):
+            if key in value:
+                text = money_text(value[key], depth + 1)
+                if text:
+                    currency = money_text(value.get("currency") or value.get("currencyCode"), depth + 1)
+                    return (currency + " " + text).strip()
+        return ""
+    if isinstance(value, (list, tuple)) and depth < 3:
+        for entry in value:
+            text = money_text(entry, depth + 1)
+            if text:
+                return text
+    return ""
+
+
+def order_price(value, *, context="订单复核页", required=True):
+    """读取金额。
+
+    官网在不同页面/商品类型下返回的字段并不一致（字符串、带货币符号、结构化对象、
+    甚至没有金额），这里尽量把能识别的金额取出来；只在 required=True（下单前的
+    订单总额核对）时才因为没有金额而停止。
+    """
+    text = money_text(value)
+    match = MONEY_WITH_CURRENCY.search(text)
+    if match:
+        return re.sub(r"\s+", " ", text[match.start():match.end()]).strip()
+    if MONEY_BARE.match(text):
+        return re.sub(r"\s+", " ", text).strip()
+    if not required:
+        return ""
+    raise ValueError(f"{context}缺少可识别的金额（官网返回：{text[:60] or '空值'}），已停止，未提交订单。")
+
+
+def checkout_auto():
+    """是否全自动下单（不询问配送方式、不二次确认）。
+
+    缺省启用：只有本地预设里明确关掉（auto_checkout: false）才为 False。
+    """
+    from checkout_options import read_config
+    try:
+        config = read_config(ROOT / "checkout.json")
+    except (OSError, ValueError):
+        return True
+    return config.get("auto_checkout") is not False if isinstance(config, dict) else True
+
+
+def confirm_order(model, auto=False):
     review = field(model, "checkout.review", {})
     rows = []
     for item in model_item_nodes(review.get("fulfillmentReview", {})):
@@ -858,12 +938,14 @@ def confirm_order(model):
             raise ValueError("订单商品数量无效，未提交订单。")
         name = order_text(field(item, "d.name") or field(item, "d.productName") or field(item, "d.sku"))
         # 与官网商品组件及复核页 summary 使用相同字段；totalPrice 是该行小计。
-        rows.append(f"{len(rows) + 1}. {name} × {quantity}  小计 {order_price(field(item, 'd.totalPrice'))}")
+        rows.append(f"{len(rows) + 1}. {name} × {quantity}  小计 "
+                    + order_price(field(item, 'd.totalPrice')))
     if not rows:
         raise ValueError("订单复核页没有商品，未提交订单。")
     summary = field(review, "summary.d", {})
     total = order_price(summary.get("totalAfterTradeIn") if summary.get("showTotalAfterTradeinAsTotal")
-                        else field(summary, "installmentTotal.value") or summary.get("total"))
+                        else field(summary, "installmentTotal.value") or summary.get("total"),
+                        context="订单复核页")
     print("\n即将结算整个购物袋：")
     print("\n".join(rows))
     details = field(model, "checkout.companionBar.orderDetails", {})
@@ -874,6 +956,10 @@ def confirm_order(model):
     if delivery:
         print("送货地址：" + order_text(delivery))
     print(f"\n总支付：{total}")
+    if auto:
+        # 全自动下单：订单只生成付款二维码，实际支付由用户扫码，无需二次确认。
+        print("全自动下单：已跳过二次确认，直接创建订单并获取付款二维码。")
+        return
     if interaction.handler is not None:
         details = {"items": [{"name": order_text(field(item, "d.name") or field(item, "d.productName") or field(item, "d.sku")),
                               "sku": field(item, "d.sku"), "quantity": int(field(item, "itemQuantity.d.quantity")),
@@ -928,6 +1014,57 @@ def finish_payment(flow):
     raise ValueError("订单仍在处理中，请稍后运行 -o 查询订单。")
 
 
+def applecare_enabled():
+    """本地预设是否要求同时购买 AppleCare+。"""
+    from checkout_options import read_config
+    try:
+        config = read_config(ROOT / "checkout.json")
+    except (OSError, ValueError):
+        return False
+    return bool(config.get("applecare")) if isinstance(config, dict) else False
+
+
+def applecare_recommendations(cart):
+    """袋内每个商品的内联 AppleCare+ 推荐（商品已挂 AppleCare+ 时官网就不会再下发）。"""
+    for key in [k for k in (cart.get("items") or {}) if k.startswith("item-")]:
+        node = field(cart, f"items.{key}.inlineRecommendations")
+        if not isinstance(node, dict):
+            continue
+        for sku in node.get("c", []):
+            entry = node.get(sku)
+            if (isinstance(entry, dict) and field(entry, "d.isAppleCare") is True
+                    and field(entry, "a.add.url")):
+                yield {"item": key, "sku": sku,
+                       "title": str(field(entry, "d.title") or sku),
+                       "price": str(field(entry, "d.price") or "")}
+
+
+def add_applecare(flow, enable=True):
+    """按本地预设为袋内商品加购 AppleCare+（官网内联推荐，动作名 add）。
+
+    幂等：官网在商品已挂 AppleCare+ 时不再下发该推荐，因此“推荐还在”就等于“还没加”。
+    """
+    cart = flow.require("shoppingCart")
+    targets = list(applecare_recommendations(cart))
+    if not targets:
+        return []
+    if not enable:
+        print("本地预设未勾选 AppleCare+，保持裸机下单。")
+        return []
+    request_get(flow.session, "加购令牌", BASE_URL + "/shop/beacon/atb")
+    added = []
+    for target in targets:
+        key, sku, title = target["item"], target["sku"], target["title"]
+        path = f"shoppingCart.items.{key}.inlineRecommendations.{sku}"
+        flow.action(path, "add", {"shoppingCart.locationConsent.locationConsent": "false"})
+        remaining = [r["sku"] for r in applecare_recommendations(flow.require("shoppingCart"))]
+        if sku in remaining:
+            raise ValueError(f"AppleCare+ 未确认加入购物袋（{title}），已停止下单。")
+        added.append(target)
+        print(f"已加入 AppleCare+：{title}" + (f"（{target['price']}）" if target["price"] else ""))
+    return added
+
+
 def pay_bag(*, flow=None):
     standalone = flow is None
     with (requests.Session() if standalone else nullcontext(flow.session)) as session:
@@ -939,6 +1076,8 @@ def pay_bag(*, flow=None):
                 flow.page(BASE_URL + "/shop/bag", "结账购物袋")
             else:
                 log.info("[结账购物袋] 复用加购后的实时购物袋模型和会话，跳过重复 GET。")
+            cart = flow.require("shoppingCart")
+            added_applecare = add_applecare(flow, applecare_enabled())
             cart = flow.require("shoppingCart")
             expected = model_items(cart.get("items", {}))
             if not expected:
@@ -959,7 +1098,7 @@ def pay_bag(*, flow=None):
                     data[prefix + address + "." + name] = field(item, address[1:] + ".d." + name, "CN" if name == "countryCode" else "")
             flow.action("shoppingCart.actions", "checkout", data)
             reauthenticate_checkout(flow)
-            checkout_delivery(flow)
+            delivery_note = checkout_delivery(flow)
             checkout_shipping(flow)
             billing = "checkout.billing.billingOptions"
             options = flow.require(billing)["d"].get("options", [])
@@ -973,11 +1112,20 @@ def pay_bag(*, flow=None):
                     field(review, "billingReview.alipayReview.d.alipayLabel") != "ALIPAY" or
                     model_items(review.get("fulfillmentReview", {})) != expected):
                 raise ValueError("订单复核未通过：商品、数量、支付方式或下单状态不符合预期。")
-            confirm_order(flow.model)
+            confirm_order(flow.model, auto=checkout_auto())
             save_auth(session)
             interaction.report_stage("正在提交订单", order_submitted=True)
             flow.action("checkout.review.placeOrder", "continueFromReviewToProcess")
             result = finish_payment(flow)
+            if isinstance(delivery_note, str) and delivery_note:
+                result["delivery_note"] = delivery_note
+                message = str(result.get("message", "")).strip()
+                result["message"] = (message + " " + delivery_note).strip()
+            if added_applecare:
+                result["applecare"] = added_applecare
+                names = "、".join(f"{a['title']}{'（' + a['price'] + '）' if a['price'] else ''}"
+                                  for a in added_applecare)
+                result["message"] = f"已含 AppleCare+：{names}。" + str(result.get("message", ""))
             if PAYMENT_ROOT is not None:
                 # Keep the issued payment link even if fetching its QR image is interrupted.
                 write_private_json(PAYMENT_ROOT / "payment.json", result)
@@ -989,37 +1137,208 @@ def pay_bag(*, flow=None):
                 save_auth(session)
 
 
-def purchase_sku(part, sms=False, quantity=1):
-    part = normalize_sku(part)
-    if type(quantity) is not int or quantity < 1:
-        raise ValueError("加购数量必须是正整数。")
+MAX_BAG_ITEMS = 10
+
+
+def normalize_items(items):
+    """把商品列表规整成 [(sku, quantity)]：合并同款、校验数量与条目数。
+
+    接受 [{sku, quantity}]、单个 {sku, quantity}、["SKU", ...]（按 1 件计），
+    以及 (sku, 数量) 这样的二元组（规整过的结果再传进来也不会报错）。
+    """
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, (list, tuple)):
+        raise ValueError("商品列表格式不正确：应为一个列表。")
+    if not items:
+        raise ValueError("请至少选择一件商品。")
+    if len(items) > MAX_BAG_ITEMS:
+        raise ValueError(f"一次最多下单 {MAX_BAG_ITEMS} 种商品。")
+    merged = {}
+    for entry in items:
+        if isinstance(entry, str):
+            entry = {"sku": entry, "quantity": 1}
+        elif isinstance(entry, (list, tuple)) and len(entry) == 2 and type(entry[1]) is int:
+            entry = {"sku": entry[0], "quantity": entry[1]}
+        if not isinstance(entry, dict):
+            raise ValueError("商品条目格式不正确：每件商品要写成 {sku, quantity}。")
+        raw = entry.get("sku")
+        part = normalize_sku(raw if isinstance(raw, str) else "")
+        quantity = entry.get("quantity", 1)
+        if type(quantity) is not int or not 1 <= quantity <= 999:
+            raise ValueError("加购数量必须是 1–999 的整数。")
+        merged[part] = merged.get(part, 0) + quantity
+    for part, quantity in merged.items():
+        if quantity > 999:
+            raise ValueError(f"{part} 的合计数量超过 999，请拆成两次下单。")
+    return list(merged.items())
+
+
+def add_items(items, *, flow=None):
+    """把多种商品加入购物袋（同一会话内依次加购，URL 与令牌共用）。"""
+    targets = normalize_items(items)
+    standalone = flow is None
+    with (requests.Session() if standalone else nullcontext(flow.session)) as session:
+        if standalone:
+            authenticate(session, strong=True)
+            flow = Checkout(session)
+        try:
+            if standalone:
+                flow.page(BASE_URL + "/shop/bag", "加购前购物袋")
+            for part, quantity in targets:
+                add_to_bag(part, quantity=quantity, set_total=True, flow=flow)
+            cart = flow.require("shoppingCart")
+            bag_total = order_price(field(cart, "summary.d.total"), context="购物袋", required=False)
+            bag = model_items(cart.get("items", {}))
+            print(f"购物袋已确认：{len(bag)} 种商品，总金额 {bag_total}。")
+            first_part, first_quantity = targets[0]
+            return {"success": True, "part": first_part, "quantity": first_quantity,
+                    "items": [{"part": part, "quantity": quantity} for part, quantity in targets],
+                    "bag": [{"sku": sku, "quantity": quantity} for sku, quantity in bag],
+                    "bag_total": bag_total}
+        finally:
+            if standalone:
+                save_auth(session)
+
+
+def prepare_flow(session, sms=False, refreshed=False):
+    """确保商城已登录（必要时登录），返回可以加购/结账的 flow。"""
+    flow = Checkout(session)
+    flow.page(BASE_URL + "/shop/bag", "加购前购物袋")
+    if not check_login(session, page=flow.page_response)["logged_in"]:
+        if refreshed:
+            raise ValueError("完整登录后商城仍未识别为已登录，已停止加购；未重复尝试登录。")
+        print("当前未登录，开始登录。")
+        save_auth(session)
+        try:
+            login(sms=sms)
+        finally:
+            # 包括登录失败清理后的配置，避免旧 Session 在退出时覆盖新凭证。
+            load_auth(session, json.loads(AUTH_PATH.read_text(encoding="utf-8")))
+        flow = Checkout(session)
+        flow.page(BASE_URL + "/shop/bag", "重新登录后购物袋")
+    else:
+        print("商城已登录。")
+    return flow
+
+
+def bag_missing(flow, targets):
+    """购物袋里还没达到目标数量的商品（(sku, 目标数量)）。"""
+    missing = []
+    for part, quantity in targets:
+        _, item = cart_item(flow, part)
+        current = int(field(item, "itemQuantity.d.quantity", 0)) if item else 0
+        if current < quantity:
+            missing.append((part, quantity))
+    return missing
+
+
+def ensure_bag(flow, targets, *, attempts=12, pause=0.5, probe=None):
+    """把目标商品补齐（数量设为总数）；到点刚开售时会失败，这里负责重试。"""
+    last = ""
+    for attempt in range(1, attempts + 1):
+        if probe:
+            probe()
+        if not bag_missing(flow, targets):
+            return
+        try:
+            for part, quantity in bag_missing(flow, targets):
+                add_to_bag(part, quantity=quantity, set_total=True, flow=flow)
+        except (ValueError, requests.RequestException) as error:
+            last = str(error)
+        if not bag_missing(flow, targets):
+            return
+        print(f"加入购物袋未成功（第 {attempt}/{attempts} 次）：{last or '官网未确认数量'}")
+        if attempt < attempts:
+            time.sleep(pause)
+    raise ValueError("商品未能加入购物袋：" + (last or "官网未确认数量") + "；未继续结账。")
+
+
+def wait_until(target, probe=None, label="等待"):
+    """等待到指定时间（本机 epoch 秒）。可被取消，最后 2 秒用高精度轮询。"""
+    reported = 0.0
+    while True:
+        remaining = target - time.time()
+        if remaining <= 0:
+            return
+        if probe:
+            probe()
+        if remaining > 2:
+            now = time.time()
+            if now - reported >= 30:
+                reported = now
+                print(f"{label}：还有 {int(remaining // 60)} 分 {int(remaining % 60)} 秒。")
+            time.sleep(min(remaining - 1, 5.0))
+        else:
+            # 到点前 2 秒用短睡眠，尽量贴住发售时刻（Python 3.11+ 在 Windows 也是高精度等待）。
+            time.sleep(min(remaining, 0.02))
+
+
+def timed_purchase(items, at, warmup=300, sms=False, probe=None):
+    """定时抢购：到点前预热（提前刷新会话、尽量提前加购），到点立刻结账。
+
+    预热的作用是避免整点被登录、验证码、加购失败堵住：账号会话在预热阶段刷新，
+    商品尽量先放进购物袋；到点只做"补齐 + 结账"。预热失败也可以照常到点重试。
+    """
+    targets = normalize_items(items)
+    at = float(at)
+    warmup = min(max(int(warmup), 0), 3600)
+    now = time.time()
+    if at < now - 5:
+        raise ValueError("抢购时间已经过去，请重新设置。")
+    at = max(at, now)
+    ensure_auth_file()
+    with requests.Session() as session:
+        load_auth(session, json.loads(AUTH_PATH.read_text(encoding="utf-8")))
+        if at - warmup > time.time():
+            print("定时抢购：已锁定目标 " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(at))
+                  + "，将于 " + time.strftime("%H:%M:%S", time.localtime(at - warmup))
+                  + " 开始预热（提前 " + str(warmup) + " 秒）。")
+            wait_until(at - warmup, probe, "预热倒计时")
+        print("定时抢购：开始预热——刷新账号会话并把商品放进购物袋。")
+        flow = None
+        warmed = False
+        try:
+            refreshed = ensure_strong_login(session, sms=sms)
+            flow = prepare_flow(session, sms=sms, refreshed=refreshed)
+            ensure_bag(flow, targets, attempts=3, pause=1.0, probe=probe)
+            warmed = True
+            print("预热完成：会话有效，商品已在购物袋。")
+            save_auth(session)
+        except (ValueError, requests.RequestException) as error:
+            print("预热未完成：" + str(error) + "；到点会重新登录并再试一次。")
+        wait_until(at, probe, "到点倒计时")
+        print("定时抢购：到点，开始下单——" + "、".join(f"{part} × {quantity}" for part, quantity in targets))
+        try:
+            if not warmed:
+                load_auth(session, json.loads(AUTH_PATH.read_text(encoding="utf-8")))
+                refreshed = ensure_strong_login(session, sms=sms)
+                flow = prepare_flow(session, sms=sms, refreshed=refreshed)
+            ensure_bag(flow, targets, probe=probe)
+            return pay_bag(flow=flow)
+        finally:
+            save_auth(session)
+
+
+def purchase_items(items, sms=False):
+    targets = normalize_items(items)
     ensure_auth_file()
     with requests.Session() as session:
         load_auth(session, json.loads(AUTH_PATH.read_text(encoding="utf-8")))
         refreshed = ensure_strong_login(session, sms=sms)
         try:
-            flow = Checkout(session)
-            flow.page(BASE_URL + "/shop/bag", "加购前购物袋")
-            status = check_login(session, page=flow.page_response)
-            if not status["logged_in"]:
-                if refreshed:
-                    raise ValueError("完整登录后商城仍未识别为已登录，已停止加购；未重复尝试登录。")
-                print("当前未登录，开始登录。")
-                save_auth(session)
-                try:
-                    login(sms=sms)
-                finally:
-                    # 包括登录失败清理后的配置，避免旧 Session 在退出时覆盖新凭证。
-                    load_auth(session, json.loads(AUTH_PATH.read_text(encoding="utf-8")))
-                flow = Checkout(session)
-                flow.page(BASE_URL + "/shop/bag", "重新登录后购物袋")
-            else:
-                print("商城已登录。")
-            print(f"目标购买数量：{part} × {quantity}")
-            add_to_bag(part, quantity=quantity, set_total=True, flow=flow)
+            flow = prepare_flow(session, sms=sms, refreshed=refreshed)
+            print("目标购买：" + "、".join(f"{part} × {quantity}" for part, quantity in targets))
+            for part, quantity in targets:
+                add_to_bag(part, quantity=quantity, set_total=True, flow=flow)
             return pay_bag(flow=flow)
         finally:
             save_auth(session)
+
+
+def purchase_sku(part, sms=False, quantity=1):
+    '''单商品入口（命令行 -k / 兼容旧调用）：等价于 purchase_items。'''
+    return purchase_items([{"sku": part, "quantity": quantity}], sms=sms)
 
 
 def wait_for_order_query():

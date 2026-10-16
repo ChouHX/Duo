@@ -24,11 +24,16 @@ const ACTIONS: &[&str] = &[
     "bag",
     "add",
     "purchase",
+    "timed_purchase",
     "checkout",
     "catalog",
     "address_read",
     "address_save",
     "region",
+    "region_options",
+    "stores",
+    "store_save",
+    "preset_apply",
     "import_auth",
     "forget_password",
     "qr",
@@ -50,6 +55,10 @@ fn local_defaults() -> Account {
         pending: false,
         preset_sku: default_sku(),
         preset_quantity: default_quantity(),
+        preset_items: vec![PresetItem {
+            sku: default_sku(),
+            quantity: default_quantity(),
+        }],
     }
 }
 fn now() -> u64 {
@@ -73,6 +82,40 @@ pub struct Account {
     pub preset_sku: String,
     #[serde(default = "default_quantity")]
     pub preset_quantity: u32,
+    /// 预设的全部商品（多商品下单）；preset_sku / preset_quantity 是第一件的镜像。
+    #[serde(default)]
+    pub preset_items: Vec<PresetItem>,
+}
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+pub struct PresetItem {
+    pub sku: String,
+    #[serde(default = "default_quantity")]
+    pub quantity: u32,
+}
+const MAX_PRESET_ITEMS: usize = 10;
+fn clean_items(items: Vec<PresetItem>) -> Result<Vec<PresetItem>, String> {
+    if items.is_empty() || items.len() > MAX_PRESET_ITEMS {
+        return Err(format!("请填写 1–{MAX_PRESET_ITEMS} 种商品"));
+    }
+    let mut merged: Vec<PresetItem> = Vec::new();
+    for item in items {
+        let sku = item.sku.trim().to_ascii_uppercase();
+        if sku.is_empty()
+            || sku.len() > 30
+            || !sku.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
+            || !(1..=999).contains(&item.quantity)
+        {
+            return Err("请填写有效的 SKU 和 1–999 的数量".into());
+        }
+        match merged.iter_mut().find(|known| known.sku == sku) {
+            Some(known) => known.quantity = (known.quantity + item.quantity).min(999),
+            None => merged.push(PresetItem {
+                sku,
+                quantity: item.quantity,
+            }),
+        }
+    }
+    Ok(merged)
 }
 fn default_sku() -> String {
     "MK2U4CH".into()
@@ -246,6 +289,7 @@ impl Engine {
             pending: true,
             preset_sku: defaults.preset_sku,
             preset_quantity: defaults.preset_quantity,
+            preset_items: defaults.preset_items,
         };
         let address = self.root.join("settings/checkout.json");
         if address.exists() {
@@ -347,22 +391,18 @@ impl Engine {
     pub fn save_preset(
         &self,
         account_id: &str,
-        sku: String,
-        quantity: u32,
+        items: Vec<PresetItem>,
     ) -> Result<Account, String> {
-        let sku = sku.trim().to_ascii_uppercase();
-        if sku.is_empty()
-            || sku.len() > 30
-            || !sku.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
-            || !(1..=999).contains(&quantity)
-        {
-            return Err("请填写有效的 SKU 和 1–999 的数量".into());
+        let items = clean_items(items)?;
+        fn apply(account: &mut Account, items: Vec<PresetItem>) {
+            account.preset_sku = items[0].sku.clone();
+            account.preset_quantity = items[0].quantity;
+            account.preset_items = items;
         }
         if account_id == LOCAL_ID {
             let mut defaults = self.defaults.lock().unwrap();
             let mut next = defaults.clone();
-            next.preset_sku = sku;
-            next.preset_quantity = quantity;
+            apply(&mut next, items);
             private_json(&self.root.join("settings/purchase.json"), &next)?;
             *defaults = next.clone();
             return Ok(next);
@@ -373,8 +413,7 @@ impl Engine {
             .iter_mut()
             .find(|a| a.id == account_id)
             .ok_or("账号不存在")?;
-        account.preset_sku = sku;
-        account.preset_quantity = quantity;
+        apply(account, items);
         let result = account.clone();
         private_json(&self.root.join("accounts.json"), &next)?;
         *accounts = next;
@@ -446,7 +485,8 @@ impl Engine {
             return Err("这个账号正在移除，无法开始新任务".into());
         }
         let account = if account_id == LOCAL_ID {
-            if !matches!(action.as_str(), "catalog" | "address_read" | "address_save") {
+            if !matches!(action.as_str(), "catalog" | "address_read" | "address_save"
+                | "region_options" | "stores" | "store_save") {
                 return Err("此操作需要选择并登录 Apple 账号".into());
             }
             local_defaults()
@@ -459,7 +499,8 @@ impl Engine {
                 .cloned()
                 .ok_or("账号不存在")?
         };
-        if account.pending && !matches!(action.as_str(), "enroll" | "address_read" | "address_save")
+        if account.pending && !matches!(action.as_str(), "enroll" | "address_read" | "address_save"
+            | "region_options" | "store_save" | "preset_apply")
         {
             return Err("请先完成账号添加与登录验证".into());
         }
@@ -924,7 +965,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let engine = Engine::new(temp.path().into()).unwrap();
         let old = engine.add_account("old@example.test".into()).unwrap();
-        engine.save_preset(LOCAL_ID, "MK2W4CH".into(), 3).unwrap();
+        engine
+            .save_preset(
+                LOCAL_ID,
+                vec![PresetItem {
+                    sku: "MK2W4CH".into(),
+                    quantity: 3,
+                }],
+            )
+            .unwrap();
         private_json(
             &temp.path().join("settings/checkout.json"),
             &json!({"address":{"street":"测试路"}}),
@@ -933,6 +982,8 @@ mod tests {
         let new = engine.add_account("new@example.test".into()).unwrap();
         assert_eq!(new.preset_sku, "MK2W4CH");
         assert_eq!(new.preset_quantity, 3);
+        assert_eq!(new.preset_items.len(), 1);
+        assert_eq!(new.preset_items[0].sku, "MK2W4CH");
         assert!(scope_dir(temp.path(), &new.id)
             .join("checkout.json")
             .exists());
@@ -942,6 +993,7 @@ mod tests {
         assert!(new.pending);
         let restored = Engine::new(temp.path().into()).unwrap().snapshot();
         assert_eq!(restored.defaults.preset_sku, "MK2W4CH");
+        assert_eq!(restored.defaults.preset_items[0].quantity, 3);
         assert_eq!(restored.accounts.len(), 2);
         assert_eq!(restored.accounts[0].preset_sku, "MK2U4CH");
     }
@@ -958,7 +1010,8 @@ mod tests {
             let result = engine.start(host.clone(), LOCAL_ID.into(), (*action).into(), json!({}));
             assert_eq!(
                 result.is_ok(),
-                matches!(*action, "catalog" | "address_read" | "address_save"),
+                matches!(*action, "catalog" | "address_read" | "address_save"
+                    | "region_options" | "stores" | "store_save"),
                 "{action}"
             );
         }
@@ -1158,7 +1211,20 @@ mod tests {
         let e = Engine::new(temp.path().into()).unwrap();
         let a = e.add_account("a@example.test".into()).unwrap();
         let b = e.add_account("b@example.test".into()).unwrap();
-        e.save_preset(&a.id, "mlh74fe".into(), 3).unwrap();
+        e.save_preset(
+            &a.id,
+            vec![
+                PresetItem {
+                    sku: "mlh74fe".into(),
+                    quantity: 3,
+                },
+                PresetItem {
+                    sku: "mjta4ch".into(),
+                    quantity: 1,
+                },
+            ],
+        )
+        .unwrap();
         let state = Engine::new(temp.path().into()).unwrap().snapshot();
         assert_eq!(
             state
@@ -1178,5 +1244,69 @@ mod tests {
                 .preset_sku,
             "MK2U4CH"
         );
+        // 多商品预设：SKU 大写、第二件保留；镜像字段是第一件。
+        let saved = state.accounts.iter().find(|p| p.id == a.id).unwrap();
+        assert_eq!(
+            saved.preset_items,
+            vec![
+                PresetItem {
+                    sku: "MLH74FE".into(),
+                    quantity: 3
+                },
+                PresetItem {
+                    sku: "MJTA4CH".into(),
+                    quantity: 1
+                }
+            ]
+        );
+        assert_eq!(saved.preset_sku, "MLH74FE");
+    }
+
+    #[test]
+    fn preset_items_are_merged_and_validated() {
+        let temp = tempfile::tempdir().unwrap();
+        let e = Engine::new(temp.path().into()).unwrap();
+        let a = e.add_account("a@example.test".into()).unwrap();
+        // 同一个 SKU 重复填写会合并数量。
+        let saved = e
+            .save_preset(
+                &a.id,
+                vec![
+                    PresetItem {
+                        sku: "mk2u4ch".into(),
+                        quantity: 1,
+                    },
+                    PresetItem {
+                        sku: "MK2U4CH/A".into(),
+                        quantity: 2,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(saved.preset_items.len(), 2);
+        assert_eq!(saved.preset_items[0].sku, "MK2U4CH");
+        assert_eq!(saved.preset_items[1].sku, "MK2U4CH/A");
+        assert_eq!(saved.preset_quantity, 1);
+        assert!(e.save_preset(&a.id, vec![]).is_err());
+        assert!(e
+            .save_preset(
+                &a.id,
+                vec![PresetItem {
+                    sku: "MK2U4CH".into(),
+                    quantity: 0
+                }]
+            )
+            .is_err());
+        assert!(e
+            .save_preset(
+                &a.id,
+                (0..MAX_PRESET_ITEMS + 1)
+                    .map(|i| PresetItem {
+                        sku: format!("MK2U4C{i}"),
+                        quantity: 1
+                    })
+                    .collect()
+            )
+            .is_err());
     }
 }

@@ -60,7 +60,8 @@ def main():
             raise ValueError('任务与账号标识不匹配。')
         account = request.get('account', '')
         local = args.account_id.int == 0
-        if local and request.get('action') not in ('catalog', 'address_read', 'address_save'):
+        if local and request.get('action') not in ('catalog', 'address_read', 'address_save',
+                                                   'region_options', 'stores', 'store_save'):
             raise ValueError('此操作需要选择并登录 Apple 账号。')
         if not local and (not isinstance(account, str) or not account.strip()):
             raise ValueError('账号不能为空。')
@@ -81,11 +82,25 @@ def main():
         error = exc
         # Never include requests' exception URLs, headers, or a traceback with locals.
         import requests
-        message = '网络请求失败，请检查网络或系统代理。' if isinstance(exc, requests.RequestException) else str(exc)
+        if isinstance(exc, requests.RequestException):
+            # 官网 5xx / 429 与用户的网络、代理无关，别让用户白折腾代理设置。
+            from apple_login import is_transient_status
+            status = getattr(getattr(exc, 'response', None), 'status_code', None)
+            message = ('Apple 官网暂时不可用（HTTP %s），请稍后重试；账号与本地配置已保留。' % status
+                       if status is not None and is_transient_status(status)
+                       else '网络请求失败，请检查网络或系统代理。')
+        else:
+            message = str(exc)
         if not isinstance(exc, (ValueError, OSError)):
             message = f'操作未完成（{type(exc).__name__}），请查看任务阶段。'
         if service and service.submitted:
             message += ' 订单提交结果可能未确认，请查询订单后再决定下一步。'
+        try:  # 只写入本机任务日志，便于排查；不把堆栈发给界面。
+            import traceback
+            import duo_killer
+            duo_killer.log.error('任务异常：%s', traceback.format_exc())
+        except Exception:
+            pass
         channel.emit('error', message=message[:2000], order_submitted=bool(service and service.submitted),
                      account_invalid=bool(service and service.should_remove_account(exc)))
     finally:

@@ -94,6 +94,32 @@ class AccountCheckTests(unittest.TestCase):
                 self.service.run('me', {})
             self.assertFalse(self.service.should_remove_account(caught.exception))
 
+    def test_transient_site_failure_does_not_start_a_full_relogin(self):
+        """官网 5xx / 429 时重登只会撞上同一个错误，应直接让用户稍后重试。"""
+        from apple_login import LoginError
+        error = ValueError('Apple 官网暂时不可用（HTTP 503，错误代码 []）：请稍后重试；账号与本地配置已保留。')
+        error.__cause__ = LoginError('官网暂时不可用', status=503)
+        self.info.side_effect = error
+        with self.assertRaises(ValueError) as caught:
+            self.service.run('me', {})
+        self.assertEqual(self.info.call_count, 1)
+        self.login.assert_not_called()
+        self.assertFalse(self.service.should_remove_account(caught.exception))
+        self.assertIn('官网暂时不可用', str(caught.exception))
+
+    def test_transient_status_is_read_from_wrapped_and_bare_errors(self):
+        from apple_login import LoginError
+        for status in (429, 502, 503, 504):
+            with self.subTest(status=status):
+                self.assertEqual(self.service.transient_status(LoginError('x', status=status)), status)
+                wrapped = ValueError('wrapped')
+                wrapped.__cause__ = LoginError('x', status=status)
+                self.assertEqual(self.service.transient_status(wrapped), status)
+        for status in (401, 403, 409, 541):
+            self.assertIsNone(self.service.transient_status(LoginError('x', status=status)), status)
+        self.assertIsNone(self.service.transient_status(ValueError('没有状态码')))
+        self.assertIsNone(self.service.transient_status(requests.Timeout('离线')))
+
     def test_business_errors_cancel_and_first_enrollment_do_not_remove_account(self):
         from protocol import Cancelled
         self.service.action = 'checkout'

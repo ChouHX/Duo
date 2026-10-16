@@ -47,8 +47,10 @@ export function localWebBridge(): Bridge {
     snapshot: () => call("snapshot"),
     add: (email) => call("add_account", { email }),
     remove: (accountId) => call("remove_account", { accountId }),
-    savePreset: (accountId, sku, quantity) =>
-      call("save_preset", { accountId, sku, quantity }),
+    savePreset: (accountId, items) => call("save_preset", { accountId, items }),
+    openUrl: async (url) => {
+      window.open(url, "_blank", "noopener,noreferrer");
+    },
     start: (accountId, action, params) =>
       call("start_task", { accountId, action, params }),
     reply: (accountId, taskId, requestId, value) =>

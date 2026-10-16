@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Apple 登录协议实现，由 duo_killer.py -l 调用。"""
 import base64
+import contextlib
 import hashlib
 import json
 import logging
@@ -39,6 +40,49 @@ class LoginError(Exception):
         self.codes = tuple(codes)
 
 
+class BrowserContextError(LoginError):
+    """取浏览器上下文失败（网络 / 内核 / 代理 / 代理认证），不代表账号失效。
+
+    与真正的账号认证失败区分开，避免把这类失败当成“当前用户已失效”而移除账号。
+    """
+
+
+def is_transient_status(status):
+    """官网的瞬时故障状态码：等几秒重试通常就能过，且与账号、密码无关。
+
+    541 单独排除：它是官网的反爬拦截，重试无用，必须重建浏览器上下文。
+    """
+    return status == 429 or (500 <= status < 600 and status != 541)
+
+
+# 官网瞬时故障（5xx / 429）时的重试次数与退避基数：3 次共约 18 秒，足够熬过抖动。
+TRANSIENT_RETRIES = 3
+TRANSIENT_RETRY_DELAY = 3.0
+
+
+def describe_http_failure(status, codes):
+    """把官网返回的 HTTP 失败翻译成用户能照着做的一句话。
+
+    原始文案（“请求失败：HTTP 503，错误代码 []”）看不出是官网的问题还是自己的账号问题，
+    用户会误以为账号失效，于是反复重登、反复改密码。5xx / 429 必须说清楚“不是你的账号问题，
+    稍后重试即可，本地配置已保留”。
+    """
+    detail = f"HTTP {status}，错误代码 {list(codes)}"
+    if status == 541:
+        return (f"Apple 官网拒绝了本次商城请求（{detail}）：这是官网的反爬拦截，"
+                "不是账号或密码问题。请关闭正在占用的 Chrome 后重试；账号与本地配置已保留。")
+    if status == 429:
+        return (f"Apple 官网要求降低请求频率（{detail}）：请等待几分钟再重试，"
+                "期间不要连续点击；账号与本地配置已保留。")
+    if status >= 500:
+        return (f"Apple 官网暂时不可用（{detail}）：这是官网服务端的问题，"
+                "不是账号或密码问题。请稍后重试；账号与本地配置已保留。")
+    if status == 403:
+        return (f"Apple 官网拒绝了本次请求（{detail}）：可能是会话或反爬校验未通过。"
+                "请稍后重试；账号与本地配置已保留。")
+    return (f"请求失败：{detail}。未输出响应正文，以免泄露账号或令牌。")
+
+
 def browser_profile_path(auth_path=None):
     auth_path = Path(auth_path).expanduser() if auth_path is not None else None
     root = auth_path.parent if auth_path else Path(__file__).resolve().parent
@@ -48,6 +92,95 @@ def browser_profile_path(auth_path=None):
         identity = str(auth_path.resolve()).encode("utf-8")
         profile_name = "native-" + hashlib.sha256(identity).hexdigest()[:12]
     return root / ".chrome-profile" / profile_name
+
+
+def launch_browser_profile(auth_path=None, *, extra_args=()):
+    """启动本机 Chrome（专用配置 + 调试端口），返回 (进程, 端口, 配置目录)。"""
+    chrome = find_browser()
+    profile = browser_profile_path(auth_path)
+    profile.mkdir(mode=0o700, parents=True, exist_ok=True)
+    profile.chmod(0o700)
+    proxies = requests.utils.get_environ_proxies(str(profile.parent))
+    proxy_url = proxies.get("https") or proxies.get("all")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    args = [str(chrome), "--user-data-dir=" + str(profile),
+            "--remote-debugging-port=" + str(port),
+            "--remote-debugging-address=127.0.0.1",
+            "--restore-last-session", "--no-first-run", "--no-default-browser-check",
+            "--window-size=500,640", *extra_args]
+    if proxy_url:
+        parsed = urlsplit(proxy_url)
+        if parsed.username or parsed.password:
+            raise BrowserContextError("暂不支持需要账号密码的代理，请使用本机无认证代理。")
+        args.append("--proxy-server=" + proxy_url)
+    process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return process, port, profile
+
+
+def stop_browser_process(process):
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+@contextlib.contextmanager
+def open_browser_page(auth_path=None, *, url=HOME, timeout=45):
+    """在专用 Chrome 配置里打开官网页面并交出 page。
+
+    官网部分接口（如门店可用性 fulfillment-messages）只认真实浏览器：requests
+    即使带上有效 Cookie 也会被 541 拦截，所以需要借浏览器自身的请求上下文。
+    """
+    try:
+        from playwright.sync_api import sync_playwright, Error as BrowserError
+    except ImportError:
+        raise BrowserContextError("此操作需要 Playwright，请安装 requirements.txt 中的依赖。") from None
+    try:
+        process, port, _profile = launch_browser_profile(auth_path)
+    except ValueError as error:
+        raise BrowserContextError(str(error)) from None
+    try:
+        with sync_playwright() as playwright:
+            browser = None
+            deadline = time.monotonic() + 30
+            while browser is None:
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise BrowserContextError("未能连接脚本启动的 Chrome，请先关闭占用专用配置的浏览器后重试。")
+                try:
+                    browser = playwright.chromium.connect_over_cdp(
+                        f"http://127.0.0.1:{port}", timeout=1000, no_defaults=True)
+                except BrowserError:
+                    time.sleep(0.2)
+            try:
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = context.pages[0] if context.pages else context.new_page()
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+                except BrowserError:
+                    pass  # 页面没完全加载也可以发同源请求
+                yield page
+            finally:
+                for owned in browser.contexts:
+                    for opened in list(owned.pages):
+                        try:
+                            opened.close()
+                        except BrowserError:
+                            pass
+                try:
+                    browser.new_browser_cdp_session().send("Browser.close")
+                except BrowserError:
+                    pass
+    except BrowserError:
+        raise BrowserContextError("浏览器初始化失败，请检查网络/代理及专用浏览器配置。") from None
+    finally:
+        stop_browser_process(process)
 
 
 def load_credentials(path):
@@ -165,6 +298,10 @@ def hashcash(bits, challenge, max_seconds=30):
 
 
 class AppleStoreLogin:
+    # 官网瞬时故障（5xx / 429）时取页面的重试次数与退避基数；测试里可调小避免等待。
+    transient_retries = TRANSIENT_RETRIES
+    transient_retry_delay = TRANSIENT_RETRY_DELAY
+
     def __init__(self, user_agent=UA, auth_path=None, session=None):
         self.session = session if session is not None else requests.Session()
         if session is None:
@@ -194,7 +331,7 @@ class AppleStoreLogin:
         if (profile / ".authx-541").exists():
             # 不移动仍被 Chrome 使用的配置，也不删除旧数据。
             if os.path.lexists(profile / "SingletonLock"):
-                raise LoginError("待重建的专用 Chrome 配置仍有进程锁，请先关闭该浏览器后重试。")
+                raise BrowserContextError("待重建的专用 Chrome 配置仍有进程锁，请先关闭该浏览器后重试。")
             backup = profile.with_name("native-rejected-" + uuid.uuid4().hex)
             profile.rename(backup)
             print(f"上次商城回调返回 541，旧浏览器配置已保留至 {backup}，本次重新取得上下文。")
@@ -210,11 +347,11 @@ class AppleStoreLogin:
         try:
             from playwright.sync_api import sync_playwright, Error as BrowserError
         except ImportError:
-            raise LoginError("首次获取浏览器 Cookie 需要 Playwright，请使用当前 Python 安装 requirements.txt。") from None
+            raise BrowserContextError("首次获取浏览器 Cookie 需要 Playwright，请使用当前 Python 安装 requirements.txt。") from None
         try:
             chrome = find_browser()
         except ValueError as error:
-            raise LoginError(str(error)) from None
+            raise BrowserContextError(str(error)) from None
         proxies = requests.utils.get_environ_proxies(HOME)
         proxy_url = proxies.get("https") or proxies.get("all")
         profile_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -230,7 +367,7 @@ class AppleStoreLogin:
         if proxy_url:
             parsed = urlsplit(proxy_url)
             if parsed.username or parsed.password:
-                raise LoginError("自动获取上下文暂不支持需要账号密码的代理，请使用本机无认证代理。")
+                raise BrowserContextError("自动获取上下文暂不支持需要账号密码的代理，请使用本机无认证代理。")
             args.append("--proxy-server=" + proxy_url)
         print(f"正常启动 Chrome，使用专用配置：{profile}。自动获取上下文后关闭并保留浏览器数据。")
         process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -241,30 +378,14 @@ class AppleStoreLogin:
                 deadline = time.monotonic() + 30
                 while browser is None:
                     if process.poll() is not None or time.monotonic() >= deadline:
-                        raise LoginError("未能连接脚本启动的 Chrome，请关闭占用专用配置的浏览器后重试。")
+                        raise BrowserContextError("未能连接脚本启动的 Chrome，请关闭占用专用配置的浏览器后重试。")
                     try:
                         browser = playwright.chromium.connect_over_cdp(
                             f"http://127.0.0.1:{port}", timeout=1000, no_defaults=True)
                     except BrowserError:
                         time.sleep(0.2)
                 try:
-                    context = browser.contexts[0]
-                    page = context.pages[0] if context.pages else context.new_page()
-                    # 两个页面仍完成正常加载；Cookie 就绪后立即继续，不固定等待十秒。
-                    for url in (HOME, HOME + "shop/bag"):
-                        reply = page.goto(url, wait_until="load", timeout=45000)
-                        if reply is None or reply.status >= 400:
-                            raise LoginError("Chrome 未能正常打开官网页面，未更新上下文。")
-                    for _ in range(80):
-                        cookies = context.cookies()
-                        if any(c["name"] == "shld_bt_ck" and c["value"]
-                               and c["domain"].lstrip(".") == "apple.com.cn"
-                               and (c.get("expires", -1) < 0 or c["expires"] > time.time()) for c in cookies):
-                            break
-                        page.wait_for_timeout(250)
-                    else:
-                        raise LoginError("Chrome 尚未取得所需浏览器上下文，已停止；请检查浏览器页面或代理后重试。")
-                    user_agent = page.evaluate("navigator.userAgent")
+                    cookies, user_agent = self._harvest_context(browser, "Chrome")
                 finally:
                     # 关闭专用配置中本次及历史恢复的标签页，避免下次启动继续累积。
                     # 保留 restore-last-session，让 Chrome 继续持久保存会话 Cookie。
@@ -279,7 +400,7 @@ class AppleStoreLogin:
                     except BrowserError:
                         pass
         except BrowserError:
-            raise LoginError("Chrome 初始化失败，请检查网络/代理及专用浏览器配置。") from None
+            raise BrowserContextError("Chrome 初始化失败，请检查网络/代理及专用浏览器配置。") from None
         finally:
             try:
                 process.wait(timeout=10)
@@ -291,6 +412,11 @@ class AppleStoreLogin:
                     process.kill()
                     process.wait()
             interaction.report_stage("浏览器已关闭", browser_pid=None)
+        self._apply_context(cookies, user_agent)
+        log.info("[浏览器上下文] 初始化耗时 %.2fs", time.monotonic() - started)
+        return True
+
+    def _apply_context(self, cookies, user_agent):
         # 成功采集后整组替换旧非认证上下文，不拼接两次会话中的 Cookie。
         for cookie in list(self.session.cookies):
             if (cookie.domain.lstrip(".") in ("apple.com.cn", "www.apple.com.cn")
@@ -308,9 +434,58 @@ class AppleStoreLogin:
                 rest={"HttpOnly": None} if c.get("httpOnly") else {}))
             count += 1
         self.session.headers.update({"User-Agent": user_agent, "Accept-Language": "zh-CN,zh;q=0.9"})
-        print(f"Chrome 初始化完成，已取得 {count} 个商城上下文 Cookie。")
-        log.info("[浏览器上下文] 初始化耗时 %.2fs", time.monotonic() - started)
-        return True
+        print(f"浏览器上下文初始化完成，已取得 {count} 个商城上下文 Cookie。")
+
+    @staticmethod
+    def _ready_context_cookies(context):
+        """商城上下文就绪时返回当前全部 Cookie（官网用 shld_bt_ck 表示上下文），否则返回 None。"""
+        cookies = context.cookies()
+        for cookie in cookies:
+            if (cookie["name"] == "shld_bt_ck" and cookie["value"]
+                    and cookie["domain"].lstrip(".") == "apple.com.cn"
+                    and (cookie.get("expires", -1) < 0 or cookie["expires"] > time.time())):
+                return cookies
+        return None
+
+    def _harvest_context(self, browser, label):
+        try:
+            from playwright.sync_api import Error as BrowserError
+        except ImportError:  # 只有 initialize_browser_context 会调到这里，兜底而已。
+            BrowserError = Exception
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.pages[0] if context.pages else context.new_page()
+        # 这一步的唯一目标是拿到商城上下文 Cookie（shld_bt_ck 等），不要求页面“完整加载”：
+        # - wait_until="load" 要等所有子资源，官网首页 / 购物袋页很重，慢网或走代理时直接超时；
+        # - 官网对新配置常回 403 / 429 / 541，这些响应本身照样下发上下文 Cookie，
+        #   一见到非 2xx 就中止，会把本来可用的会话白白挡掉（表现为“未能正常打开官网页面”）。
+        # 所以改成：记录问题、两个页面都走完，最终以“有没有拿到 Cookie”为准；
+        # 首轮没拿到就重载一次再试，覆盖官网的临时拦截。
+        problems = []
+        for attempt in (1, 2):
+            for url in (HOME, HOME + "shop/bag"):
+                try:
+                    reply = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                except BrowserError as error:
+                    problems.append(f"{url} 打开失败（{error}）")
+                    continue
+                if reply is not None and reply.status >= 400:
+                    problems.append(f"{url} 返回 HTTP {reply.status}")
+            # Cookie 就绪后立即继续，不固定等待十秒。
+            for _ in range(80):
+                cookies = self._ready_context_cookies(context)
+                if cookies is not None:
+                    try:
+                        user_agent = page.evaluate("navigator.userAgent")
+                    except BrowserError:
+                        user_agent = self.session.headers.get("User-Agent", UA)
+                    return cookies, user_agent
+                page.wait_for_timeout(250)
+            if attempt == 1:
+                print(f"{label} 首轮未取得上下文 Cookie，重新加载官网页面后再试一次。")
+        detail = '：' + '；'.join(dict.fromkeys(problems)) if problems else ''
+        raise BrowserContextError(
+            f"{label} 尚未取得所需浏览器上下文，已停止{detail}。"
+            "请保持网络畅通，或关闭占用专用浏览器配置的窗口后重试。")
 
     def restore_trust(self):
         if self.auth_path is None:
@@ -385,13 +560,33 @@ class AppleStoreLogin:
             self.update_trust(response)
         return response
 
+    def request_retrying(self, method, url, **kwargs):
+        """发送请求；GET 遇到官网瞬时故障时短暂等待后重试。
+
+        503 / 502 / 504 / 429 属于官网侧的临时状态，几秒后往往自行恢复。不重试的话，
+        一次瞬时故障就会被呈现成“登录失败”，用户只能反复手点、甚至误改密码。
+        只重试 GET：POST 可能已经生效，重发有副作用。
+        """
+        attempts = self.transient_retries if method == "GET" else 1
+        attempt = 0
+        while True:
+            attempt += 1
+            response = self.request(method, url, **kwargs)
+            if attempt >= attempts or not is_transient_status(response.status_code):
+                return response
+            delay = self.transient_retry_delay * attempt
+            log.warning("%s %s 返回 HTTP %s，%.1f 秒后重试（第 %s/%s 次）。",
+                        method, urlsplit(url).path, response.status_code, delay, attempt, attempts - 1)
+            time.sleep(delay)
+
     def page(self, url, *, method="GET", data=None):
         for _ in range(10):
             headers = {"Referer": self.store_referrer} if self.store_referrer else {}
             if method == "POST":
                 headers.update({"Origin": "https://" + urlsplit(self.store_referrer or url).netloc,
                                 "Content-Type": "application/x-www-form-urlencoded"})
-            response = self.request(method, url, headers=headers, **({"data": data} if method == "POST" else {}))
+            response = self.request_retrying(method, url, headers=headers,
+                                             **({"data": data} if method == "POST" else {}))
             if response.status_code not in (301, 302, 303, 307, 308):
                 self.expect(response, (200,))
                 self.store_referrer = response.url
@@ -417,8 +612,7 @@ class AppleStoreLogin:
         if response.status_code not in allowed or errors:
             codes = [str(x.get("code", "")) for x in (errors or []) if isinstance(x, dict)]
             codes = [x for x in codes if re.fullmatch(r"[-A-Za-z0-9_]{1,64}", x)]
-            raise LoginError(f"请求失败：HTTP {response.status_code}，错误代码 {codes}。"
-                             "未输出响应正文，以免泄露账号或令牌。",
+            raise LoginError(describe_http_failure(response.status_code, codes),
                              status=response.status_code, codes=codes)
         return data
 
@@ -450,9 +644,9 @@ class AppleStoreLogin:
         return response, data
 
     def flyout(self):
-        response = self.request("GET", HOME + "cn/shop/bag/flyout",
-                                params={"apikey": self.api_key, "l": HOME},
-                                headers={"Referer": HOME, "Accept": "*/*"})
+        response = self.request_retrying("GET", HOME + "cn/shop/bag/flyout",
+                                         params={"apikey": self.api_key, "l": HOME},
+                                         headers={"Referer": HOME, "Accept": "*/*"})
         data = self.expect(response, (200,))
         if not isinstance(data, dict) or not isinstance(data.get("links"), list):
             raise LoginError("首页菜单未返回有效的 links，无法判断登录状态。")
@@ -511,7 +705,7 @@ class AppleStoreLogin:
                   "redirect_uri": store_origin, "response_type": "code",
                   "response_mode": "web_message", "state": frame,
                   "authVersion": "latest", "language": cfg.get("locale", "zh_CN")}
-        response = self.request("GET", AUTH + "/authorize/signin", params=params)
+        response = self.request_retrying("GET", AUTH + "/authorize/signin", params=params)
         self.expect(response, (200,))
         boot = [v for attrs, v in json_scripts(response.text) if "boot_args" in attrs]
         domain = find_value(boot, "domainId")
@@ -637,7 +831,8 @@ class AppleStoreLogin:
             return self._login(account, password, sms, signin_url=signin_url, signin_response=signin_response)
         except (LoginError, requests.RequestException, EOFError, KeyboardInterrupt) as error:
             self.discard_failed_login(error)
-            if isinstance(error, LoginError) and (error.status is None or error.status in (400, 401, 403, 409, 541)):
+            if (isinstance(error, LoginError) and not isinstance(error, BrowserContextError)
+                    and (error.status is None or error.status in (400, 401, 403, 409, 541))):
                 interaction.report_stage("重新认证未通过", authentication_failed=True)
             if isinstance(error, LoginError) and error.status == 401 and "-20101" in error.codes:
                 raise LoginError(
